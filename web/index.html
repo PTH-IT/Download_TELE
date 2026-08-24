@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Telegram Transfer Control</title>
+    <style>
+      :root {
+        --bg: #07111d;
+        --panel: rgba(12, 24, 39, 0.92);
+        --panel-strong: #101d2e;
+        --line: rgba(255,255,255,0.08);
+        --text: #eff4fb;
+        --muted: #7f8ca3;
+        --accent: #66e0ff;
+        --accent-2: #ff7a59;
+        --good: #74f0b7;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(102,224,255,0.18), transparent 28%),
+          linear-gradient(135deg, #07111d 0%, #0b1825 100%);
+        color: var(--text);
+        min-height: 100vh;
+      }
+
+      .shell {
+        max-width: 1260px;
+        margin: 0 auto;
+        padding: 32px 20px 40px;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: 1.3fr 0.7fr;
+        gap: 18px;
+        align-items: stretch;
+        margin-bottom: 18px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        box-shadow: 0 18px 60px rgba(0,0,0,0.24);
+        backdrop-filter: blur(18px);
+      }
+
+      .hero-main {
+        padding: 28px;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .hero-main::after {
+        content: "";
+        position: absolute;
+        inset: auto -40px -60px auto;
+        width: 240px;
+        height: 240px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(102,224,255,0.28), transparent 70%);
+        pointer-events: none;
+      }
+
+      .eyebrow {
+        display: inline-block;
+        color: var(--accent);
+        text-transform: uppercase;
+        letter-spacing: 0.25em;
+        font-size: 0.75rem;
+        font-weight: 700;
+        margin-bottom: 12px;
+      }
+
+      h1 {
+        font-size: clamp(1.8rem, 3vw, 2.6rem);
+        margin: 0 0 12px;
+        line-height: 1.06;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+      }
+
+      .lead {
+        color: var(--muted);
+        max-width: 62ch;
+        line-height: 1.6;
+        margin: 0 0 18px;
+      }
+
+      .hero-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+
+      .btn {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 16px;
+        font-weight: 700;
+        cursor: pointer;
+        color: var(--text);
+      }
+
+      .btn-primary { background: linear-gradient(90deg, var(--accent), #3cb7e0); }
+      .btn-secondary { background: rgba(255,255,255,0.08); }
+
+      .hero-side {
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .stat-grid {
+        display: grid;
+        gap: 12px;
+      }
+
+      .mini-stat {
+        padding: 14px;
+        background: var(--panel-strong);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+      }
+
+      .mini-stat strong {
+        display: block;
+        font-size: 1.15rem;
+        margin-top: 4px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 1.2fr 0.8fr;
+        gap: 18px;
+      }
+
+      .card { padding: 20px; }
+
+      .section-title {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 14px;
+      }
+
+      .section-title h2 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 700;
+      }
+
+      .pill {
+        color: var(--muted);
+        font-size: 0.82rem;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 6px 10px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th, td {
+        text-align: left;
+        padding: 10px 8px;
+        border-bottom: 1px solid var(--line);
+        font-size: 0.95rem;
+      }
+
+      th { color: var(--muted); font-weight: 600; }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-weight: 700;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--good);
+        box-shadow: 0 0 0 4px rgba(116,240,183,0.16);
+      }
+
+      .dot-done { background: var(--good); box-shadow: 0 0 0 4px rgba(116,240,183,0.16); }
+      .dot-running { background: var(--accent); box-shadow: 0 0 0 4px rgba(102,224,255,0.16); }
+      .dot-pending { background: var(--good); box-shadow: 0 0 0 4px rgba(116,240,183,0.16); }
+
+      .queue-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .queue-item {
+        padding: 12px 14px;
+        background: var(--panel-strong);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+
+      .queue-item small { color: var(--muted); display: block; margin-top: 4px; }
+
+      .accent { color: var(--accent); }
+      .accent-2 { color: var(--accent-2); }
+
+      /* Scroll container for tables */
+      .table-wrapper {
+        max-height: 400px;
+        overflow-y: auto;
+      }
+
+      @media (max-width: 920px) {
+        .hero, .grid { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <section class="hero">
+        <div class="panel hero-main">
+          <div class="eyebrow">Telegram transfer control room</div>
+          <h1>Move media between channels with calm, visible control.</h1>
+          <p class="lead">Live queues, worker health, and real-time transfer progress. Create a job and watch it move from download → upload.</p>
+
+<div class="hero-actions">
+             <button class="btn btn-primary" id="btnOpenJob">Tạo Job mới</button>
+             <a href="/jobs.html" class="btn btn-secondary" id="btnJobsList">Danh sách Jobs</a>
+             <button class="btn btn-secondary" id="btnRefresh">Làm mới</button>
+           </div>
+
+          <div id="jobModal" style="display:none; margin-top:16px; padding:16px; border:1px solid var(--line); border-radius:16px; background: rgba(0,0,0,0.15);">
+<div class="section-title" style="margin-bottom:10px;">
+               <h2 style="font-size:1rem;">Tạo Job</h2>
+               <button class="btn btn-secondary" style="padding:6px 12px;" id="btnCloseJob">Đóng</button>
+             </div>
+
+            <div class="queue-list" style="gap:10px;">
+<label style="display:block;">
+                 <small style="color:var(--muted);">Link nguồn nhóm</small>
+                 <input id="src_link" type="text" style="width:100%; margin-top:6px; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:rgba(255,255,255,0.06); color:var(--text);" placeholder="https://t.me/+LIKSlzftJLQxZmJl" />
+               </label>
+
+               <label style="display:block;">
+                 <small style="color:var(--muted);">Link đích nhóm</small>
+                <input id="dst_link" type="text" style="width:100%; margin-top:6px; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:rgba(255,255,255,0.06); color:var(--text);" placeholder="https://t.me/+dlKekMFugns2N2Nl" />
+              </label>
+
+<div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
+                 <label style="display:block;">
+                   <small style="color:var(--muted);">Từ msg_id (tùy chọn)</small>
+                   <input id="from_msg_id" type="number" style="width:100%; margin-top:6px; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:rgba(255,255,255,0.06); color:var(--text);" />
+                 </label>
+                 <label style="display:block;">
+                   <small style="color:var(--muted);">Đến msg_id (tùy chọn)</small>
+                   <input id="to_msg_id" type="number" style="width:100%; margin-top:6px; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:rgba(255,255,255,0.06); color:var(--text);" />
+                 </label>
+               </div>
+
+               <button class="btn btn-primary" id="btnCreateJob" style="width:100%;">Tạo Job</button>
+              <div id="jobResult" style="color:var(--muted); font-size:0.9rem;"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel hero-side">
+          <div class="stat-grid">
+            <div class="mini-stat">
+              <span class="accent">Queue depth</span>
+              <strong id="queueDepthStrong">—</strong>
+            </div>
+            <div class="mini-stat">
+              <span class="accent-2">Active workers</span>
+              <strong id="workersStrong">—</strong>
+            </div>
+            <div class="mini-stat">
+              <span>Transfer rate</span>
+              <strong id="transferRateStrong">—</strong>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Jobs List Section -->
+      <section style="margin-bottom: 20px;">
+        <div class="panel card">
+          <div class="section-title">
+            <h2>Danh sách Job</h2>
+            <span class="pill">Tất cả</span>
+          </div>
+          <div class="table-wrapper" id="jobsTableWrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Job ID</th>
+                  <th>Tên Job</th>
+                  <th>Link/ID Nguồn</th>
+                  <th>Ngày tạo</th>
+                  <th>Trạng thái</th>
+                  <th>Hành động</th>
+                </tr>
+              </thead>
+              <tbody id="jobsTbody">
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="grid">
+        <div class="panel card">
+          <div class="section-title">
+            <h2>Live transfer feed</h2>
+            <span class="pill">Realtime</span>
+          </div>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Video</th>
+                  <th>Status</th>
+                  <th>Worker</th>
+                  <th>Speed</th>
+                  <th>Downloaded</th>
+                </tr>
+              </thead>
+              <tbody id="feedTbody">
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel card">
+          <div class="section-title">
+            <h2>Queue priorities</h2>
+            <span class="pill">Download first</span>
+          </div>
+          <div class="queue-list">
+            <div class="queue-item">
+              <div>
+                <strong>Download queue</strong>
+                <small>Higher priority than uploads</small>
+              </div>
+              <span class="accent" id="downloadQueueCount">—</span>
+            </div>
+            <div class="queue-item">
+              <div>
+                <strong>Upload queue</strong>
+                <small>Processes after downloads clear</small>
+              </div>
+              <span class="accent-2" id="uploadQueueCount">—</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+<script>
+      const API_BASE = (window.API_BASE || "http://localhost:8000").replace(/\/$/, "");
+
+      // Check auth state and redirect to login if not authenticated
+      async function checkAuth() {
+        try {
+          const res = await fetch(`${API_BASE}/api/auth/state`, { method: "GET" });
+          const state = await res.json();
+          if (!state.authenticated) {
+            window.location.href = "/login.html";
+            return false;
+          }
+          return true;
+        } catch (e) {
+          window.location.href = "/login.html";
+          return false;
+        }
+      }
+
+      function setText(id, text) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text;
+      }
+
+    async function fetchRealtimeStats() {
+      const res = await fetch(`${API_BASE}/api/stats/realtime`, { method: "GET" });
+      if (!res.ok) throw new Error(`stats: ${res.status}`);
+      return await res.json();
+    }
+
+    async function fetchWorkers() {
+      const res = await fetch(`${API_BASE}/api/workers`, { method: "GET" });
+      if (!res.ok) throw new Error(`workers: ${res.status}`);
+      return await res.json();
+    }
+
+    async function fetchJobs() {
+      const res = await fetch(`${API_BASE}/api/jobs`, { method: "GET" });
+      if (!res.ok) throw new Error(`jobs: ${res.status}`);
+      return await res.json();
+    }
+
+    function statusBadge(status) {
+      const s = (status || "").toLowerCase();
+      let label = "Queued";
+      if (s.includes("upload")) label = "Uploading";
+      else if (s.includes("download") || s.includes("downloading")) label = "Downloading";
+      else if (s.includes("down")) label = "Downloading";
+      else if (s.includes("pending")) label = "Queued";
+      else if (s.includes("done") || s.includes("completed")) label = "Done";
+      else if (s.includes("failed")) label = "Failed";
+      else if (s.includes("cancel")) label = "Cancelled";
+
+      const dotColor = label === "Done" ? "var(--good)" : label === "Failed" ? "var(--accent-2)" : "var(--good)";
+      return `<span class="status"><span class="dot" style="background:${label === "Failed" ? "var(--accent-2)" : label === "Done" ? "var(--good)" : "var(--good)"}"></span>${label}</span>`;
+    }
+
+    // Render jobs table
+    async function renderJobs() {
+      try {
+        const jobs = await fetchJobs();
+        const tbody = document.getElementById("jobsTbody");
+        if (!tbody) return;
+
+tbody.innerHTML = jobs.map(job => {
+          const created = job.created_at ? new Date(job.created_at).toLocaleDateString() : "—";
+          const source = job.src_link || "—";
+          let statusLabel = "Pending";
+          if ((job.status || "").toLowerCase().includes("done") || (job.status || "").toLowerCase().includes("completed")) statusLabel = "Completed";
+          else if ((job.status || "").toLowerCase().includes("running") || (job.status || "").toLowerCase().includes("download") || (job.status || "").toLowerCase().includes("upload")) statusLabel = "Active";
+          const statusCls = statusLabel === "Completed" ? "dot-done" : statusLabel === "Pending" ? "dot-pending" : "dot-running";
+          return `
+            <tr data-job-id="${job.id}">
+              <td><strong>#JOB-${job.id}</strong></td>
+              <td>${job.src_title || job.dst_title || "—"}</td>
+              <td style="max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${source}</td>
+              <td>${created}</td>
+              <td><span class="status"><span class="dot ${statusCls}"></span>${statusLabel}</span></td>
+              <td><a href="/job-detail.html?id=${job.id}" class="btn btn-secondary" style="padding:4px 8px; font-size:0.8rem;">Xem Chi Tiết</a></td>
+            </tr>
+          `;
+        }).join("");
+      } catch (e) {
+        console.warn("renderJobs failed:", e?.message || e);
+      }
+    }
+
+    // Fetch tasks for a specific job and show in modal or navigate
+    async function showJobDetail(jobId) {
+      window.location.href = `/job-detail.html?id=${jobId}`;
+    }
+
+    function upsertFeedRow(identifier, payload = {}) {
+      const tbody = document.getElementById("feedTbody");
+      if (!tbody) return;
+
+      const type = payload.type || "";
+      const workerId = payload.worker_id || "—";
+      const current = payload.current;
+      const total = payload.total;
+      const rowKey = String(identifier ?? payload.job_id ?? payload.task_id ?? payload.msg_id ?? type ?? "event");
+      const displayId = payload.job_id ? `JOB-${payload.job_id}` : identifier ? `#${identifier}` : "event";
+
+      const existing = tbody.querySelector(`[data-vid="${rowKey}"]`);
+      let row = existing;
+      if (!row) {
+        row = document.createElement("tr");
+        row.setAttribute("data-vid", rowKey);
+        row.innerHTML = `
+          <td>${displayId}</td>
+          <td></td>
+          <td></td>
+          <td></td>
+          <td></td>
+        `;
+        tbody.prepend(row);
+      }
+
+      const statusCell = row.children[1];
+      const workerCell = row.children[2];
+      const speedCell = row.children[3];
+      const downloadedCell = row.children[4];
+
+      const speed =
+        (typeof current === "number" && typeof total === "number" && total > 0)
+          ? `${((current / 1024 / 1024).toFixed(1))} MB/s (${((current / total) * 100).toFixed(0)}%)`
+          : "—";
+
+      const downloaded =
+        (typeof current === "number" && typeof total === "number" && total > 0)
+          ? `${(current / 1024 / 1024).toFixed(1)} MB / ${(total / 1024 / 1024).toFixed(1)} MB`
+          : "—";
+
+      statusCell.innerHTML = statusBadge(type || "");
+      workerCell.textContent = workerId;
+      speedCell.textContent = speed;
+      downloadedCell.textContent = downloaded;
+
+      while (tbody.children.length > 50) {
+        tbody.removeChild(tbody.lastChild);
+      }
+    }
+
+    function connectProgressWS() {
+      const url = new URL(API_BASE);
+      const wsProto = url.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${wsProto}//${url.host}/ws/progress`;
+
+      const ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => console.log("[ws] progress connected");
+      ws.onclose = () => {
+        console.log("[ws] closed; retrying in 2s");
+        setTimeout(connectProgressWS, 2000);
+      };
+      ws.onerror = () => {};
+
+      ws.onmessage = (evt) => {
+        try {
+          const payload = JSON.parse(evt.data);
+          const identifier = payload.task_id ?? payload.msg_id ?? payload.job_id ?? "";
+          if (identifier === "" && !payload.type) return;
+          upsertFeedRow(identifier === "" ? null : String(identifier), payload);
+        } catch (e) {}
+      };
+    }
+
+    async function refreshAll() {
+      try {
+        const [stats, workers] = await Promise.all([fetchRealtimeStats(), fetchWorkers()]);
+
+        const qd = stats.queue_download ?? 0;
+        const uq = stats.queue_upload ?? 0;
+        setText("queueDepthStrong", `${qd} downloads · ${uq} uploads`);
+
+        const onlineCount = Array.isArray(workers) ? workers.filter(w => w.online).length : 0;
+        const totalCount = Array.isArray(workers) ? workers.length : 0;
+        setText("workersStrong", `${onlineCount} online / ${totalCount} registered`);
+
+        setText("transferRateStrong", `DL: ${stats.tasks?.downloading ?? 0} / UP: ${stats.tasks?.uploading ?? 0}`);
+
+        const pending = stats.tasks?.pending ?? 0;
+        const downloading = stats.tasks?.downloading ?? 0;
+        const uploading = stats.tasks?.uploading ?? 0;
+        setText("downloadQueueCount", `${pending + downloading} waiting`);
+        setText("uploadQueueCount", `${uploading} uploading`);
+
+        await renderJobs();
+      } catch (e) {
+        console.warn("refreshAll failed:", e?.message || e);
+      }
+    }
+
+    function openModal() {
+      const modal = document.getElementById("jobModal");
+      if (modal) modal.style.display = "block";
+    }
+    function closeModal() {
+      const modal = document.getElementById("jobModal");
+      if (modal) modal.style.display = "none";
+    }
+
+    async function createJob() {
+      const src_link = document.getElementById("src_link").value.trim();
+      const dst_link = document.getElementById("dst_link").value.trim();
+      const from_msg_id = document.getElementById("from_msg_id").value;
+      const to_msg_id = document.getElementById("to_msg_id").value;
+
+      const body = { src_link, dst_link };
+      if (from_msg_id !== "") body.from_msg_id = Number(from_msg_id);
+      if (to_msg_id !== "") body.to_msg_id = Number(to_msg_id);
+
+      const jobResult = document.getElementById("jobResult");
+      jobResult.textContent = "Đang tạo job...";
+
+      const res = await fetch(`${API_BASE}/api/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        jobResult.textContent = `Tạo thất bại (${res.status}): ${text || "lỗi không xác định"}`;
+        return;
+      }
+
+      const created = await res.json();
+      jobResult.textContent = `Job đã tạo: #JOB-${created.id}. Đang tải lại...`;
+      closeModal();
+      await refreshAll();
+    }
+
+document.addEventListener("DOMContentLoaded", async () => {
+       const authenticated = await checkAuth();
+       if (!authenticated) return;
+        
+       document.getElementById("btnOpenJob").addEventListener("click", openModal);
+       document.getElementById("btnCloseJob").addEventListener("click", closeModal);
+       document.getElementById("btnRefresh").addEventListener("click", refreshAll);
+       document.getElementById("btnCreateJob").addEventListener("click", createJob);
+
+       refreshAll();
+       setInterval(refreshAll, 5000);
+       connectProgressWS();
+      });
+   </script>
+   </body>
+</html>

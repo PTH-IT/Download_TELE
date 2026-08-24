@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Chi Tiết Job</title>
+    <style>
+      :root {
+        --bg: #07111d;
+        --panel: rgba(12, 24, 39, 0.92);
+        --panel-strong: #101d2e;
+        --line: rgba(255,255,255,0.08);
+        --text: #eff4fb;
+        --muted: #7f8ca3;
+        --accent: #66e0ff;
+        --accent-2: #ff7a59;
+        --good: #74f0b7;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(102,224,255,0.18), transparent 28%),
+          linear-gradient(135deg, #07111d 0%, #0b1825 100%);
+        color: var(--text);
+        min-height: 100vh;
+      }
+
+      .shell {
+        max-width: 1260px;
+        margin: 0 auto;
+        padding: 32px 20px 40px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        box-shadow: 0 18px 60px rgba(0,0,0,0.24);
+        backdrop-filter: blur(18px);
+      }
+
+      .card { padding: 20px; }
+
+      .section-title {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 14px;
+      }
+
+      .section-title h2 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 700;
+      }
+
+      .pill {
+        color: var(--muted);
+        font-size: 0.82rem;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 6px 10px;
+      }
+
+      .btn {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 16px;
+        font-weight: 700;
+        cursor: pointer;
+        color: var(--text);
+      }
+
+      .btn-primary { background: linear-gradient(90deg, var(--accent), #3cb7e0); }
+      .btn-secondary { background: rgba(255,255,255,0.08); }
+
+      .info-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 16px;
+        margin-bottom: 16px;
+      }
+
+      .info-item {
+        padding: 14px;
+        background: var(--panel-strong);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+      }
+
+      .info-item label {
+        color: var(--muted);
+        font-size: 0.82rem;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .info-item .value {
+        font-size: 0.95rem;
+        word-break: break-all;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th, td {
+        text-align: left;
+        padding: 10px 8px;
+        border-bottom: 1px solid var(--line);
+        font-size: 0.95rem;
+      }
+
+      th { color: var(--muted); font-weight: 600; }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-weight: 700;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--good);
+        box-shadow: 0 0 0 4px rgba(116,240,183,0.16);
+      }
+
+      .dot-done { background: var(--good); box-shadow: 0 0 0 4px rgba(116,240,183,0.16); }
+      .dot-running { background: var(--accent); box-shadow: 0 0 0 4px rgba(102,224,255,0.16); }
+      .dot-failed { background: var(--accent-2); box-shadow: 0 0 0 4px rgba(255,122,89,0.16); }
+      .dot-pending { background: var(--good); box-shadow: 0 0 0 4px rgba(116,240,183,0.16); }
+      .dot-cancelled { background: var(--muted); box-shadow: 0 0 0 4px rgba(127,140,163,0.16); }
+
+      .table-wrapper {
+        max-height: 500px;
+        overflow-y: auto;
+      }
+
+      .back-link {
+        color: var(--accent);
+        text-decoration: none;
+        font-size: 0.9rem;
+        margin-bottom: 16px;
+        display: inline-block;
+      }
+
+      .back-link:hover { text-decoration: underline; }
+
+      .progress-bar {
+        height: 8px;
+        background: rgba(255,255,255,0.08);
+        border-radius: 4px;
+        overflow: hidden;
+        margin-top: 8px;
+      }
+
+      .progress-fill {
+        height: 100%;
+        background: var(--accent);
+        transition: width 0.3s;
+      }
+
+      @media (max-width: 768px) {
+        .info-grid { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <a href="/jobs.html" class="back-link">&larr; Quay lại danh sách Job</a>
+
+      <section style="margin-bottom: 20px;">
+        <div class="panel card">
+          <div class="section-title">
+            <h2>Thông tin Job</h2>
+            <span class="pill" id="jobStatusPill">Loading...</span>
+          </div>
+
+          <div class="info-grid" id="jobInfoGrid">
+            <div class="info-item">
+              <label>Mã Job</label>
+              <div class="value" id="jobId">—</div>
+            </div>
+            <div class="info-item">
+              <label>Tên Job</label>
+              <div class="value" id="jobName">—</div>
+            </div>
+            <div class="info-item">
+              <label>Link/ID Nguồn</label>
+              <div class="value" id="srcLink">—</div>
+            </div>
+            <div class="info-item">
+              <label>Link/ID Đích</label>
+              <div class="value" id="dstLink">—</div>
+            </div>
+            <div class="info-item">
+              <label>Ngày tạo</label>
+              <div class="value" id="createdAt">—</div>
+            </div>
+            <div class="info-item">
+              <label>Tiến độ</label>
+              <div class="value">
+                <span id="progressText">0 / 0</span>
+                <div class="progress-bar">
+                  <div class="progress-fill" id="progressBar" style="width: 0%;"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style="margin-top: 16px;">
+            <button class="btn btn-secondary" id="btnCancel" style="display:none;">Hủy Job</button>
+          </div>
+        </div>
+      </section>
+
+      <section style="margin-bottom: 20px;">
+        <div class="panel card">
+          <div class="section-title">
+            <h2>Danh sách Task</h2>
+            <span class="pill" id="tasksCount">0 task</span>
+          </div>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Task ID</th>
+                  <th>Message ID</th>
+                  <th>Trạng thái</th>
+                  <th>Worker</th>
+                  <th>Kích thước (MB)</th>
+                  <th>Tốc độ DL</th>
+                  <th>Tốc độ UP</th>
+                  <th>Lỗi</th>
+                  <th>Hành động</th>
+                </tr>
+              </thead>
+              <tbody id="tasksTbody">
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const API_BASE = (window.API_BASE || "http://localhost:8000").replace(/\/$/, "");
+
+      async function checkAuth() {
+        try {
+          const res = await fetch(`${API_BASE}/api/auth/state`, { method: "GET" });
+          const state = await res.json();
+          if (!state.authenticated) {
+            window.location.href = "/login.html";
+            return false;
+          }
+          return true;
+        } catch (e) {
+          window.location.href = "/login.html";
+          return false;
+        }
+      }
+
+      function getJobIdFromUrl() {
+        const params = new URLSearchParams(window.location.search);
+        return params.get("id");
+      }
+
+      async function fetchJob(jobId) {
+        const res = await fetch(`${API_BASE}/api/jobs/${jobId}`, { method: "GET" });
+        if (!res.ok) throw new Error(`job: ${res.status}`);
+        return await res.json();
+      }
+
+      async function fetchJobTasks(jobId) {
+        const res = await fetch(`${API_BASE}/api/jobs/${jobId}/tasks`, { method: "GET" });
+        if (!res.ok) throw new Error(`tasks: ${res.status}`);
+        return await res.json();
+      }
+
+      function formatStatus(status) {
+        const s = (status || "").toLowerCase();
+        if (s.includes("done") || s.includes("completed")) return { label: "Completed", cls: "dot-done" };
+        if (s.includes("failed")) return { label: "Failed", cls: "dot-failed" };
+        if (s.includes("cancel")) return { label: "Cancelled", cls: "dot-cancelled" };
+        if (s.includes("upload") || s.includes("uploading")) return { label: "Uploading", cls: "dot-running" };
+        if (s.includes("download") || s.includes("downloading")) return { label: "Downloading", cls: "dot-running" };
+        if (s.includes("pending")) return { label: "Pending", cls: "dot-pending" };
+        return { label: "Active", cls: "dot-running" };
+      }
+
+      function statusBadge(status, label) {
+        const { cls } = formatStatus(status);
+        return `<span class="status"><span class="dot ${cls}"></span>${label}</span>`;
+      }
+
+      async function renderJobDetail() {
+        const jobId = getJobIdFromUrl();
+        if (!jobId) return;
+
+        try {
+          const [job, tasks] = await Promise.all([fetchJob(jobId), fetchJobTasks(jobId)]);
+
+          document.getElementById("jobId").textContent = `#JOB-${job.id}`;
+          document.getElementById("jobName").textContent = job.src_title || job.dst_title || "—";
+          document.getElementById("srcLink").textContent = job.src_link || "—";
+          document.getElementById("dstLink").textContent = job.dst_link || "—";
+          document.getElementById("createdAt").textContent = job.created_at ? new Date(job.created_at).toLocaleString() : "—";
+
+          const statusInfo = formatStatus(job.status);
+          document.getElementById("jobStatusPill").textContent = statusInfo.label;
+
+          const total = Number(job.total || 0);
+          const done = Number(job.done || 0);
+          document.getElementById("progressText").textContent = `${done} / ${total}`;
+          const progressPercent = total > 0 ? Math.round((done / total) * 100) : 0;
+          document.getElementById("progressBar").style.width = `${Math.min(progressPercent, 100)}%`;
+
+          document.getElementById("tasksCount").textContent = `${Array.isArray(tasks) ? tasks.length : 0} task`;
+
+          const tbody = document.getElementById("tasksTbody");
+          if (!Array.isArray(tasks) || tasks.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; color:var(--muted); padding:24px 0;">Chưa có task nào được tạo cho job này.</td></tr>`;
+            return;
+          }
+          tbody.innerHTML = tasks.map(t => {
+            const taskStatus = formatStatus(t.status);
+            const canRetry = (t.status || "").toLowerCase() === "failed" || (t.status || "").toLowerCase() === "cancelled";
+            return `
+              <tr>
+                <td><strong>#${t.id}</strong></td>
+                <td>${t.msg_id}</td>
+                <td>${statusBadge(t.status, taskStatus.label)}</td>
+                <td>${t.worker_id || "—"}</td>
+                <td>${Number(t.size_mb || 0).toFixed(1)} MB</td>
+                <td>${Number(t.speed_dl || 0).toFixed(2)} MB/s</td>
+                <td>${Number(t.speed_up || 0).toFixed(2)} MB/s</td>
+                <td style="color:var(--accent-2);">${t.error || "—"}</td>
+                <td>${canRetry ? `<button class="btn btn-secondary" style="padding:4px 10px; font-size:0.8rem;" onclick="retryTask(${jobId}, ${t.id})">Retry</button>` : "—"}</td>
+              </tr>
+            `;
+          }).join("");
+
+          const canCancel = (job.status || "").toLowerCase() !== "cancelled" && (job.status || "").toLowerCase() !== "done";
+          document.getElementById("btnCancel").style.display = canCancel ? "inline-block" : "none";
+        } catch (e) {
+          console.error("Failed to load job detail:", e);
+          document.getElementById("jobId").textContent = "Not found";
+        }
+      }
+
+      async function cancelJob() {
+        const jobId = getJobIdFromUrl();
+        if (!jobId) return;
+
+        if (!confirm("Bạn có chắc muốn hủy job này?")) return;
+
+        const res = await fetch(`${API_BASE}/api/jobs/${jobId}/cancel`, { method: "DELETE" });
+        if (res.ok) {
+          await renderJobDetail();
+        } else {
+          alert("Hủy job thất bại");
+        }
+      }
+
+      async function retryTask(jobId, taskId) {
+        const res = await fetch(`${API_BASE}/api/jobs/${jobId}/tasks/${taskId}/retry`, { method: "POST" });
+        if (!res.ok) {
+          alert("Retry task thất bại");
+          return;
+        }
+        await renderJobDetail();
+      }
+
+      document.addEventListener("DOMContentLoaded", async () => {
+        const authenticated = await checkAuth();
+        if (!authenticated) return;
+
+        document.getElementById("btnCancel").addEventListener("click", cancelJob);
+        renderJobDetail();
+        setInterval(renderJobDetail, 5000);
+      });
+    </script>
+  </body>
+</html>

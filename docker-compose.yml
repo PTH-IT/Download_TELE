@@ -1,0 +1,83 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tgcopy
+      POSTGRES_USER: tgcopy
+      POSTGRES_PASSWORD: tgcopy_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://tgcopy:tgcopy_secret@postgres:5432/tgcopy
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./sessions:/app/sessions
+      - ./downloads:/app/downloads
+    depends_on:
+      - redis
+      - postgres
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+
+    restart: "no"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql+asyncpg://tgcopy:tgcopy_secret@postgres:5432/tgcopy
+      - SESSION_DIR=/app/sessions
+      - DOWNLOAD_DIR=/app/downloads
+      - WORKER_ID=worker-1
+
+    volumes:
+      - ./sessions:/app/sessions
+      - ./downloads:/app/downloads
+    depends_on:
+      - redis
+      - postgres
+      - api
+    deploy:
+      replicas: 1   # tăng lên để thêm worker: docker-compose up --scale worker=5
+
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./sessions:/app/sessions
+    depends_on:
+      - api
+
+
+
+volumes:
+  redis_data:
+  pg_data:
