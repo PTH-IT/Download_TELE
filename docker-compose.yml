@@ -62,13 +62,14 @@ services:
       - DATABASE_URL=postgresql+asyncpg://tgcopy:tgcopy_secret@postgres:5432/tgcopy
       - SESSION_DIR=/app/sessions
       - DOWNLOAD_DIR=/app/downloads
+      - API_ID=${API_ID:?Thiếu API_ID - tạo app tại https://my.telegram.org/apps rồi đặt trong .env}
+      - API_HASH=${API_HASH:?Thiếu API_HASH - tạo app tại https://my.telegram.org/apps rồi đặt trong .env}
       - MAX_DL=${MAX_DL:-2}
       - MAX_UP=${MAX_UP:-4}
       - WORKER_STALE_AFTER=${WORKER_STALE_AFTER:-600}
       # KHÔNG set WORKER_ID ở đây: mọi replica sẽ trùng id, ghi đè heartbeat
       # của nhau và dashboard chỉ thấy đúng 1 worker. Để trống thì worker tự
       # lấy hostname (= container id) làm id duy nhất.
-      # - API_ID / API_HASH: dùng app Telegram riêng của bạn
       # - SESSION_STRING: gán session riêng cho từng worker nếu chạy nhiều tài khoản
     volumes:
       - ./sessions:/app/sessions

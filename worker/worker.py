@@ -76,8 +76,22 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 # dashboard chỉ thấy đúng 1 worker.
 WORKER_ID = os.getenv("WORKER_ID") or f"worker-{socket.gethostname()}"
 
-API_ID = int(os.getenv("API_ID", ""))
-API_HASH = os.getenv("API_HASH", "")
+# Bắt buộc lấy từ biến môi trường — không hard-code credentials trong source.
+# Tạo app tại https://my.telegram.org/apps để có API_ID / API_HASH.
+API_ID_RAW = os.getenv("API_ID", "").strip()
+API_HASH = (os.getenv("API_HASH") or "").strip()
+
+
+def _require_credentials() -> int:
+    if not API_ID_RAW or not API_HASH:
+        raise SystemExit(
+            "Thiếu API_ID / API_HASH. Đặt chúng trong file .env "
+            "(xem .env.example) hoặc trong environment của service worker."
+        )
+    try:
+        return int(API_ID_RAW)
+    except ValueError:
+        raise SystemExit(f"API_ID phải là số, nhận được: {API_ID_RAW!r}")
 
 # Cho phép mỗi worker dùng một tài khoản Telegram riêng. Dùng chung 1 session
 # string cho nhiều worker có thể bị Telegram huỷ auth key (AUTH_KEY_DUPLICATED).
@@ -976,7 +990,12 @@ async def run_auth_master(r: aioredis.Redis, stop_event: asyncio.Event) -> Optio
     """Worker giữ AUTH_LOCK sẽ nhận số điện thoại/OTP từ web và tạo session."""
     log.info("Worker %s làm auth master — chờ OTP từ web", WORKER_ID)
     session_str = None
-    app = Client(f"tgcopy_auth_{WORKER_ID}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
+    app = Client(
+        f"tgcopy_auth_{WORKER_ID}",
+        api_id=_require_credentials(),
+        api_hash=API_HASH,
+        in_memory=True,
+    )
     await app.connect()
     try:
         while not stop_event.is_set() and not session_str:
@@ -1072,6 +1091,7 @@ async def main():
     stop_event = asyncio.Event()
 
     log.info("Khởi động worker %s", WORKER_ID)
+    api_id = _require_credentials()
 
     dl_sem = AdaptiveSemaphore(DEFAULT_MAX_DL)
     up_sem = AdaptiveSemaphore(DEFAULT_MAX_UP)
@@ -1098,7 +1118,7 @@ async def main():
     app = Client(
         f"tgcopy_{WORKER_ID}",
         session_string=session_str,
-        api_id=API_ID,
+        api_id=api_id,
         api_hash=API_HASH,
         workers=int(os.getenv("PYROGRAM_WORKERS", "8")),
         max_concurrent_transmissions=max(DEFAULT_MAX_DL, DEFAULT_MAX_UP),

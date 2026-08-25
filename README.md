@@ -12,6 +12,13 @@ web (3000)  ──►  api (8000)  ──►  postgres
 
 ## Chạy
 
+Trước tiên tạo Telegram app tại https://my.telegram.org/apps rồi điền
+`API_ID` / `API_HASH` vào `.env`:
+
+```bash
+cp .env.example .env
+```
+
 ```bash
 docker compose up -d --build
 ```
@@ -47,6 +54,7 @@ key).
 
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
+| `API_ID` / `API_HASH` | — | **bắt buộc**, lấy từ https://my.telegram.org/apps |
 | `API_PORT` / `WEB_PORT` | `8000` / `3000` | cổng publish của api và web |
 | `PG_PORT` / `REDIS_PORT` | `5432` / `6379` | cổng publish của postgres/redis (đổi khi trùng) |
 | `WORKER_REPLICAS` | `1` | số worker khi `docker compose up` |
