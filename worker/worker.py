@@ -43,6 +43,7 @@ from shared.constants import (
 )
 from shared.job_state import refresh_job_counters, update_task_status
 from shared.peers import normalize_peer
+from shared.phone import InvalidPhoneNumber, mask_phone, normalize_phone
 
 try:
     from .media_utils import (
@@ -114,6 +115,7 @@ CAPTION_LIMIT = 1024
 
 JANITOR_LOCK = "lock:janitor"
 AUTH_ERROR_KEY = "auth:last_error"
+DEFAULT_COUNTRY_CODE = os.getenv("DEFAULT_COUNTRY_CODE", "")
 # Yêu cầu OTP cũ hơn ngần này bị bỏ qua — nếu không, worker khởi động lại sẽ
 # phát lại yêu cầu tồn trong Redis và gửi OTP ngoài ý muốn.
 AUTH_REQUEST_MAX_AGE = int(os.getenv("AUTH_REQUEST_MAX_AGE", "120"))
@@ -1007,20 +1009,30 @@ async def run_auth_master(r: aioredis.Redis, stop_event: asyncio.Event) -> Optio
                 _, raw = req_payload
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8")
+                phone = ""
                 try:
                     req = json.loads(raw)
-                    phone = req.get("phone_number", "")
+                    phone = normalize_phone(req.get("phone_number"), DEFAULT_COUNTRY_CODE)
                     if _is_stale_request(req):
-                        log.info("Bỏ qua yêu cầu OTP cũ cho %s", phone)
+                        log.info("Bỏ qua yêu cầu OTP cũ cho %s", mask_phone(phone))
                         phone = ""
                     if phone:
                         sent = await app.send_code(phone)
                         await r.set(f"auth:phone_code_hash:{phone}", sent.phone_code_hash, ex=300)
                         await r.delete(AUTH_ERROR_KEY)
-                        log.info("Đã gửi OTP tới %s", phone)
+                        log.info("Đã gửi OTP tới %s", mask_phone(phone))
+                except InvalidPhoneNumber as exc:
+                    log.error("Số điện thoại không hợp lệ: %s", exc)
+                    await r.set(AUTH_ERROR_KEY, str(exc), ex=300)
                 except Exception as exc:
-                    log.error("Gửi OTP lỗi: %s", exc)
-                    await r.set(AUTH_ERROR_KEY, f"Gửi OTP lỗi: {exc}", ex=300)
+                    log.error("Gửi OTP tới %s lỗi: %s", mask_phone(phone), exc)
+                    hint = ""
+                    if "PHONE_NUMBER_INVALID" in str(exc):
+                        hint = (
+                            " — Telegram không nhận số này. Kiểm tra lại mã quốc gia,"
+                            " nhập dạng +84987654321."
+                        )
+                    await r.set(AUTH_ERROR_KEY, f"Gửi OTP lỗi: {exc}{hint}", ex=300)
 
             verify_payload = await r.brpop(AUTH_OTP_QUEUE, timeout=1)
             if not verify_payload:
@@ -1031,7 +1043,7 @@ async def run_auth_master(r: aioredis.Redis, stop_event: asyncio.Event) -> Optio
                 raw = raw.decode("utf-8")
             try:
                 data = json.loads(raw)
-                phone = data.get("phone_number", "")
+                phone = normalize_phone(data.get("phone_number"), DEFAULT_COUNTRY_CODE)
                 otp = data.get("otp", "")
                 password = data.get("password") or ""
                 if not (phone and otp):
@@ -1066,7 +1078,10 @@ async def run_auth_master(r: aioredis.Redis, stop_event: asyncio.Event) -> Optio
                 _write_session_file(session_str)
                 await r.set(AUTH_SESSION_KEY, session_str)
                 await r.delete(AUTH_ERROR_KEY)
-                log.info("Đăng nhập thành công, đã lưu session cho %s", phone)
+                log.info("Đăng nhập thành công, đã lưu session cho %s", mask_phone(phone))
+            except InvalidPhoneNumber as exc:
+                log.error("Số điện thoại không hợp lệ: %s", exc)
+                await r.set(AUTH_ERROR_KEY, str(exc), ex=300)
             except RPCError as exc:
                 log.error("Xác thực OTP lỗi RPC: %s", exc)
                 await r.set(AUTH_ERROR_KEY, f"OTP không hợp lệ: {exc}", ex=300)

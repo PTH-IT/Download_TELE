@@ -9,11 +9,13 @@ from pydantic import BaseModel
 
 from ..redis_client import get_redis
 from ..session_paths import resolve_session_dir, resolve_session_file
+from shared.phone import InvalidPhoneNumber, normalize_phone
 from shared.constants import (
     AUTH_LOCK_KEY,
     AUTH_OTP_QUEUE,
     AUTH_OTP_REQ_QUEUE,
     AUTH_SESSION_KEY,
+    WORKER_HEARTBEAT,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -21,6 +23,36 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 SESSIONS_DIR = resolve_session_dir()
 SESSION_FILE = str(resolve_session_file())
 AUTH_ERROR_KEY = "auth:last_error"
+# Mã vùng mặc định cho số nội địa bắt đầu bằng 0 (ví dụ "84"). Để trống thì
+# bắt buộc nhập số ở định dạng quốc tế.
+DEFAULT_COUNTRY_CODE = os.getenv("DEFAULT_COUNTRY_CODE", "")
+
+
+HEARTBEAT_TIMEOUT = 30
+
+
+async def _require_live_worker(redis):
+    """Không có worker nào sống thì OTP sẽ nằm im trong hàng đợi mãi mãi."""
+    heartbeats = await redis.hgetall(WORKER_HEARTBEAT)
+    now = time.time()
+    for ts in heartbeats.values():
+        try:
+            if now - float(ts) < HEARTBEAT_TIMEOUT:
+                return
+        except (TypeError, ValueError):
+            continue
+    raise HTTPException(
+        503,
+        "Chưa có worker nào chạy — worker mới là bên gửi OTP. "
+        "Khởi động worker rồi thử lại (docker compose up -d worker).",
+    )
+
+
+def _clean_phone(raw: str) -> str:
+    try:
+        return normalize_phone(raw, DEFAULT_COUNTRY_CODE)
+    except InvalidPhoneNumber as exc:
+        raise HTTPException(400, str(exc))
 
 
 def _read_session_string() -> Optional[str]:
@@ -44,9 +76,8 @@ class VerifyOTP(BaseModel):
 @router.post("/request")
 async def request_otp(body: RequestOTP, redis=Depends(get_redis)):
     """Send OTP code to Telegram. Worker with auth lock will process it."""
-    phone = body.phone_number.strip()
-    if not phone:
-        raise HTTPException(400, "phone_number required")
+    phone = _clean_phone(body.phone_number)
+    await _require_live_worker(redis)
 
     await redis.delete(AUTH_ERROR_KEY)
     payload = {
@@ -61,10 +92,11 @@ async def request_otp(body: RequestOTP, redis=Depends(get_redis)):
 @router.post("/verify")
 async def verify_otp(body: VerifyOTP, redis=Depends(get_redis)):
     """Verify OTP code. Worker will set session_string on success."""
-    phone = body.phone_number.strip()
+    phone = _clean_phone(body.phone_number)
     otp = body.otp.strip()
-    if not phone or not otp:
-        raise HTTPException(400, "phone_number and otp required")
+    if not otp:
+        raise HTTPException(400, "Chưa nhập mã OTP")
+    await _require_live_worker(redis)
 
     await redis.delete(AUTH_ERROR_KEY)
     payload = {

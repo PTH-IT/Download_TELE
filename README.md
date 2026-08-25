@@ -39,7 +39,9 @@ Muốn dashboard gọi thẳng một API ở máy khác (bỏ qua proxy), đặt
 `?api=http://ip-may-chu:8000` (xoá bằng `?api=`).
 
 Lần đầu vào dashboard sẽ bị chuyển sang `/login.html` để đăng nhập Telegram bằng
-số điện thoại + OTP. Worker giữ khoá `lock:auth_session` là bên gửi OTP và tạo
+số điện thoại + OTP. Số phải ở định dạng quốc tế (`+84987654321`); Telegram trả
+`PHONE_NUMBER_INVALID` cho số nội địa kiểu `0987654321`. Đặt
+`DEFAULT_COUNTRY_CODE=84` trong `.env` nếu muốn nhập số bắt đầu bằng 0. Worker giữ khoá `lock:auth_session` là bên gửi OTP và tạo
 session; session được lưu ở `sessions/session_string.txt` và trong Redis nên các
 worker khác dùng lại được.
 
@@ -62,6 +64,7 @@ key).
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
 | `API_ID` / `API_HASH` | — | **bắt buộc**, lấy từ https://my.telegram.org/apps |
+| `DEFAULT_COUNTRY_CODE` | — | mã quốc gia cho số bắt đầu bằng 0, ví dụ `84` |
 | `API_PORT` / `WEB_PORT` | `8000` / `3000` | cổng publish của api và web |
 | `PG_PORT` / `REDIS_PORT` | `5432` / `6379` | cổng publish của postgres/redis (đổi khi trùng) |
 | `WORKER_REPLICAS` | `1` | số worker khi `docker compose up` |

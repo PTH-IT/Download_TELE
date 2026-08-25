@@ -43,6 +43,7 @@ services:
       - DATABASE_URL=postgresql+asyncpg://tgcopy:tgcopy_secret@postgres:5432/tgcopy
       - REDIS_URL=redis://redis:6379
       - SESSION_DIR=/app/sessions
+      - DEFAULT_COUNTRY_CODE=${DEFAULT_COUNTRY_CODE:-}
     volumes:
       - ./sessions:/app/sessions
       - ./downloads:/app/downloads
@@ -66,6 +67,7 @@ services:
       - API_HASH=${API_HASH:?Thiếu API_HASH - tạo app tại https://my.telegram.org/apps rồi đặt trong .env}
       - MAX_DL=${MAX_DL:-2}
       - MAX_UP=${MAX_UP:-4}
+      - DEFAULT_COUNTRY_CODE=${DEFAULT_COUNTRY_CODE:-}
       - WORKER_STALE_AFTER=${WORKER_STALE_AFTER:-600}
       # KHÔNG set WORKER_ID ở đây: mọi replica sẽ trùng id, ghi đè heartbeat
       # của nhau và dashboard chỉ thấy đúng 1 worker. Để trống thì worker tự
