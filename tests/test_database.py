@@ -15,7 +15,7 @@ async def test_init_db_supports_sqlite(tmp_path):
     import api.database as database
 
     database = importlib.reload(database)
-    await database.init_db(retries=1, delay=0)
+    await database.init_db(retries=1, delay_s=0)
 
     async with database.AsyncSessionLocal() as session:
         result = await session.execute(select(Job))

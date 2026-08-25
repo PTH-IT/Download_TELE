@@ -4,6 +4,7 @@
 QUEUE_DOWNLOAD   = "queue:download"    # ZSET, score = priority (nhỏ = cao)
 QUEUE_UPLOAD     = "queue:upload"      # ZSET
 QUEUE_RETRY      = "queue:retry"       # LIST dead-letter
+QUEUE_NEW_JOB    = "queue:new_job"     # LIST job mới do API đẩy sang worker
 PUBSUB_PROGRESS  = "progress"          # channel pub/sub cho WebSocket
 LOCK_PREFIX      = "lock:task:"        # distributed lock mỗi task
 WORKER_HEARTBEAT = "workers:heartbeat" # HASH worker_id -> timestamp

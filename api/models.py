@@ -1,8 +1,7 @@
 """api/models.py — SQLAlchemy async models"""
-from datetime import datetime
 from sqlalchemy import (
     BigInteger, Column, DateTime, Float, ForeignKey,
-    Integer, String, Text, func,
+    Integer, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -31,13 +30,19 @@ class Job(Base):
 
 class Task(Base):
     __tablename__ = "tasks"
+    __table_args__ = (
+        # Một message chỉ tạo đúng 1 task trong mỗi job — chặn duplicate khi
+        # nhiều worker cùng scan 1 job.
+        UniqueConstraint("job_id", "msg_id", name="uq_tasks_job_msg"),
+    )
 
     id         = Column(Integer, primary_key=True, autoincrement=True)
-    job_id     = Column(Integer, ForeignKey("jobs.id"), nullable=False)
+    job_id     = Column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
     msg_id     = Column(BigInteger, nullable=False, index=True)
     caption    = Column(Text, default="")
     filename   = Column(String(512))
     file_path  = Column(String(512))
+    media_kind = Column(String(16), default="video")
     status     = Column(String(32), default="pending", nullable=False, index=True)
     worker_id  = Column(String(128))
     attempt    = Column(Integer, default=0)
@@ -53,9 +58,14 @@ class Task(Base):
 
 
 class Transferred(Base):
-    """Lịch sử msg_id đã chuyển thành công — thay thế da_chuyen.txt"""
+    """Lịch sử msg_id đã chuyển thành công — thay thế da_chuyen.txt.
+
+    Khoá chính là (job_id, msg_id): cùng một msg_id có thể xuất hiện ở nhiều
+    job khác nhau, nếu chỉ dùng msg_id làm PK thì job thứ hai sẽ dính
+    IntegrityError và task bị đánh failed dù upload đã thành công.
+    """
     __tablename__ = "transferred"
 
+    job_id    = Column(Integer, ForeignKey("jobs.id"), primary_key=True)
     msg_id    = Column(BigInteger, primary_key=True)
-    job_id    = Column(Integer, ForeignKey("jobs.id"))
     done_at   = Column(DateTime, default=func.now())

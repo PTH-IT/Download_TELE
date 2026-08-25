@@ -109,14 +109,19 @@
           <label for="otp">OTP Code</label>
           <input id="otp" type="text" placeholder="Enter code from Telegram" />
         </div>
+        <div class="input-group" style="margin-top:16px;">
+          <label for="password">Mật khẩu 2FA (chỉ khi tài khoản bật xác minh 2 bước)</label>
+          <input id="password" type="password" placeholder="Bỏ trống nếu không bật 2FA" />
+        </div>
         <button class="btn" id="btnVerify" style="margin-top:12px;">Verify</button>
       </div>
       
       <div class="error" id="errorMsg"></div>
     </div>
 
-    <script>
-      const API_BASE = (window.API_BASE || "http://localhost:8000").replace(/\/$/, "");
+    <script src="config.js"></script>
+<script>
+      const API_BASE = (window.API_BASE || `${location.protocol}//${location.hostname || "localhost"}:8000`).replace(/\/$/, "");
 
       document.getElementById("btnSendCode").addEventListener("click", async () => {
         const phone = document.getElementById("phone").value.trim();
@@ -138,10 +143,17 @@
           });
           
           if (!res.ok) throw new Error(`Failed: ${res.status}`);
-          
+
           // Show OTP section
           document.getElementById("otpSection").style.display = "block";
           document.getElementById("phone").readOnly = true;
+
+          // Worker mới là bên thực sự gửi OTP — hiện lỗi nếu nó báo về
+          for (let i = 0; i < 8; i++) {
+            await new Promise(r => setTimeout(r, 1000));
+            const st = await (await fetch(`${API_BASE}/api/auth/state`)).json();
+            if (st.error) { errorEl.textContent = st.error; break; }
+          }
         } catch (e) {
           errorEl.textContent = e.message || "Failed to send code";
           document.getElementById("btnSendCode").disabled = false;
@@ -165,7 +177,11 @@
           const res = await fetch(`${API_BASE}/api/auth/verify`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ phone_number: phone, otp }),
+            body: JSON.stringify({
+              phone_number: phone,
+              otp,
+              password: document.getElementById("password").value.trim(),
+            }),
           });
           
           if (!res.ok) throw new Error(`Failed: ${res.status}`);
@@ -180,7 +196,12 @@
               window.location.href = "/index.html";
               return;
             }
-            
+            if (state.error) {
+              errorEl.textContent = state.error;
+              document.getElementById("btnVerify").disabled = false;
+              return;
+            }
+
             await new Promise(r => setTimeout(r, 1000));
             attempts++;
           }

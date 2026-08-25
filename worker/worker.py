@@ -1,31 +1,30 @@
-import os
-import json
-import time
+"""worker/worker.py — tải media từ Telegram và upload sang chat đích.
+
+Mỗi container chạy 1 process worker. Nhiều worker cùng lấy việc từ 2 hàng đợi
+Redis (QUEUE_DOWNLOAD / QUEUE_UPLOAD) nên có thể scale ngang bằng
+`docker compose up -d --scale worker=N`.
+"""
 import asyncio
+import json
 import logging
-from typing import Any
+import os
+import socket
+import time
+from typing import Optional, Union
 
 import redis.asyncio as aioredis
 from pyrogram import Client
 from pyrogram.errors import FloodWait, RPCError
-
-from api.database import init_db
-from api.session_paths import resolve_session_dir, resolve_session_file
-
-from api.models import Job, Task, Transferred
-
-try:
-    from .media_utils import get_media_extension, is_supported_media
-except ImportError:  # pragma: no cover - direct script execution in Docker
-    from media_utils import get_media_extension, is_supported_media
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-
+from api.database import AsyncSessionLocal, init_db
+from api.models import Job, Task, Transferred
+from api.session_paths import resolve_session_dir, resolve_session_file
 from shared.constants import (
     QUEUE_DOWNLOAD,
     QUEUE_UPLOAD,
+    QUEUE_NEW_JOB,
     LOCK_PREFIX,
     AUTH_LOCK_KEY,
     AUTH_SESSION_KEY,
@@ -42,14 +41,47 @@ from shared.constants import (
     TASK_STATUS_CANCELLED,
     JOB_STATUS_CANCELLED,
 )
+from shared.job_state import refresh_job_counters, update_task_status
+from shared.peers import normalize_peer
 
-logging.basicConfig(level=logging.INFO)
+try:
+    from .media_utils import (
+        get_media_extension,
+        get_media_kind,
+        get_media_size,
+        guess_kind_from_path,
+        is_supported_media,
+    )
+except ImportError:  # pragma: no cover - chạy trực tiếp `python worker/worker.py`
+    from media_utils import (
+        get_media_extension,
+        get_media_kind,
+        get_media_size,
+        guess_kind_from_path,
+        is_supported_media,
+    )
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 log = logging.getLogger("worker")
 
 # ---- Config from env ----
-WORKER_ID = os.getenv("WORKER_ID", "worker-1")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+# WORKER_ID phải là duy nhất cho mỗi process. Khi scale bằng docker compose,
+# hostname chính là container id nên mặc định này luôn khác nhau. Nếu hard-code
+# WORKER_ID trong compose thì mọi replica sẽ ghi đè heartbeat của nhau và
+# dashboard chỉ thấy đúng 1 worker.
+WORKER_ID = os.getenv("WORKER_ID") or f"worker-{socket.gethostname()}"
+
 API_ID = int(os.getenv("API_ID", ""))
 API_HASH = os.getenv("API_HASH", "")
+
+# Cho phép mỗi worker dùng một tài khoản Telegram riêng. Dùng chung 1 session
+# string cho nhiều worker có thể bị Telegram huỷ auth key (AUTH_KEY_DUPLICATED).
+SESSION_STRING_ENV = (os.getenv("SESSION_STRING") or "").strip()
 
 SESSION_DIR = str(resolve_session_dir())
 SESSION_FILE = str(resolve_session_file())
@@ -58,16 +90,21 @@ DEFAULT_MAX_DL = int(os.getenv("MAX_DL", "2"))
 DEFAULT_MAX_UP = int(os.getenv("MAX_UP", "4"))
 
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/app/downloads")
+DELETE_AFTER_UPLOAD = os.getenv("DELETE_AFTER_UPLOAD", "1") not in ("0", "false", "False")
 
-# concurrency tuning
-QUEUE_BACKPRESSURE_UPLOAD = int(os.getenv("UPLOAD_QUEUE_BACKPRESSURE", "4"))
+MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
+LOCK_TTL = int(os.getenv("TASK_LOCK_TTL", "3600"))
+SCAN_CAP = int(os.getenv("SCAN_CAP", "200"))
+PROGRESS_INTERVAL = float(os.getenv("PROGRESS_INTERVAL", "1.0"))
+CAPTION_LIMIT = 1024
 
-# ---- Redis PubSub commands: cmd:{worker_id} ----
-CMD_LIMITS = "set_limits"
-CMD_STOP = "stop"
+JANITOR_LOCK = "lock:janitor"
+AUTH_ERROR_KEY = "auth:last_error"
 
 
 class AdaptiveSemaphore:
+    """Semaphore có thể đổi limit lúc đang chạy (lệnh set_limits từ dashboard)."""
+
     def __init__(self, limit: int):
         self._limit = max(1, int(limit))
         self._count = 0
@@ -79,55 +116,107 @@ class AdaptiveSemaphore:
                 await self._cond.wait()
             self._count += 1
 
-    def release(self):
-        async def _rel():
-            async with self._cond:
-                self._count -= 1
-                self._cond.notify_all()
-
-        try:
-            asyncio.create_task(_rel())
-        except RuntimeError:
-            pass
+    async def release(self):
+        async with self._cond:
+            self._count = max(0, self._count - 1)
+            self._cond.notify_all()
 
     async def __aenter__(self):
         await self.acquire()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        self.release()
+        # release phải được await; nếu fire-and-forget bằng create_task thì khi
+        # loop đang shutdown counter sẽ không bao giờ được trả lại.
+        await self.release()
 
-    def set_limit(self, new_limit: int):
-        new_limit = max(1, int(new_limit))
-
-        async def _set():
-            async with self._cond:
-                self._limit = new_limit
-                self._cond.notify_all()
-
-        asyncio.create_task(_set())
+    async def set_limit(self, new_limit: int):
+        async with self._cond:
+            self._limit = max(1, int(new_limit))
+            self._cond.notify_all()
 
     @property
-    def limit(self):
+    def limit(self) -> int:
         return self._limit
 
 
-def pub_progress(data: Any):
-    # progress is pushed via redis publish from async context
-    return json.dumps(data, ensure_ascii=False)
+class WorkerStats:
+    """Số liệu hiển thị trên dashboard."""
+
+    def __init__(self):
+        self.dl_speed = 0.0
+        self.up_speed = 0.0
+        self.total_done = 0
+        self.total_failed = 0
+        self.active_dl = 0
+        self.active_up = 0
+        self.current_task: Optional[int] = None
+
+    def snapshot(self, dl_limit: int, up_limit: int) -> dict:
+        return {
+            "session": "ready",
+            "current_task": self.current_task,
+            "dl_speed_mbs": round(self.dl_speed / (1 << 20), 2),
+            "up_speed_mbs": round(self.up_speed / (1 << 20), 2),
+            "total_done": self.total_done,
+            "total_failed": self.total_failed,
+            "active_dl": self.active_dl,
+            "active_up": self.active_up,
+            "max_dl": dl_limit,
+            "max_up": up_limit,
+        }
 
 
-async def heartbeat_loop(r: aioredis.Redis):
+# --------------------------------------------------------------------------
+# Redis helpers
+# --------------------------------------------------------------------------
+async def enqueue_progress(r: aioredis.Redis, payload: dict):
+    try:
+        await r.publish(PUBSUB_PROGRESS, json.dumps(payload, ensure_ascii=False))
+    except Exception as exc:  # pub/sub hỏng không được phép giết task
+        log.debug("publish progress lỗi: %s", exc)
+
+
+async def try_acquire_lock(r: aioredis.Redis, lock_key: str, ttl_sec: int = LOCK_TTL) -> bool:
+    return bool(await r.set(lock_key, WORKER_ID, nx=True, ex=ttl_sec))
+
+
+async def release_lock(r: aioredis.Redis, lock_key: str):
+    try:
+        await r.delete(lock_key)
+    except Exception:
+        pass
+
+
+async def heartbeat_loop(
+    r: aioredis.Redis,
+    stats: WorkerStats,
+    dl_sem: AdaptiveSemaphore,
+    up_sem: AdaptiveSemaphore,
+):
     while True:
-        await r.hset(WORKER_HEARTBEAT, WORKER_ID, str(time.time()))
-        log.info("Heartbeat sent")
-        # status set by main loop
+        try:
+            await r.hset(WORKER_HEARTBEAT, WORKER_ID, str(time.time()))
+            await r.hset(
+                WORKER_STATUS,
+                WORKER_ID,
+                json.dumps(stats.snapshot(dl_sem.limit, up_sem.limit), ensure_ascii=False),
+            )
+            log.debug("Heartbeat %s", WORKER_ID)
+        except Exception as exc:
+            log.warning("Heartbeat lỗi: %s", exc)
         await asyncio.sleep(5)
 
 
-async def command_listener(r: aioredis.Redis, dl_sem: AdaptiveSemaphore, up_sem: AdaptiveSemaphore, stop_event: asyncio.Event):
+async def command_listener(
+    r: aioredis.Redis,
+    dl_sem: AdaptiveSemaphore,
+    up_sem: AdaptiveSemaphore,
+    stop_event: asyncio.Event,
+):
     pubsub = r.pubsub()
-    await pubsub.subscribe(f"cmd:{WORKER_ID}")
+    # Kênh riêng theo worker + kênh broadcast cho toàn bộ worker
+    await pubsub.subscribe(f"cmd:{WORKER_ID}", "cmd:all")
     try:
         async for msg in pubsub.listen():
             if msg.get("type") != "message":
@@ -140,21 +229,26 @@ async def command_listener(r: aioredis.Redis, dl_sem: AdaptiveSemaphore, up_sem:
             except Exception:
                 payload = {}
 
-            action = payload.get("action")
-            if action == "stop":
+            if payload.get("action") == "stop":
+                log.info("Nhận lệnh stop")
                 stop_event.set()
                 return
 
-            # set_limits
             max_dl = payload.get("max_dl")
             max_up = payload.get("max_up")
             if max_dl is not None:
-                dl_sem.set_limit(int(max_dl))
+                await dl_sem.set_limit(int(max_dl))
             if max_up is not None:
-                up_sem.set_limit(int(max_up))
+                await up_sem.set_limit(int(max_up))
+            if max_dl is not None or max_up is not None:
+                log.info("Đổi limit: max_dl=%s max_up=%s", dl_sem.limit, up_sem.limit)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning("command_listener dừng: %s", exc)
     finally:
         try:
-            await pubsub.unsubscribe(f"cmd:{WORKER_ID}")
+            await pubsub.unsubscribe(f"cmd:{WORKER_ID}", "cmd:all")
         except Exception:
             pass
         try:
@@ -163,549 +257,847 @@ async def command_listener(r: aioredis.Redis, dl_sem: AdaptiveSemaphore, up_sem:
             pass
 
 
-async def update_task_status(db: AsyncSession, task_id: int, status: str, **fields):
-    values = {"status": status}
-    values.update(fields)
-    await db.execute(update(Task).where(Task.id == task_id).values(**values))
+# --------------------------------------------------------------------------
+# DB helpers
+# --------------------------------------------------------------------------
+async def fail_or_retry(
+    r: aioredis.Redis,
+    db: AsyncSession,
+    task: Task,
+    queue: str,
+    error: str,
+    stats: WorkerStats,
+):
+    """Task lỗi: còn lượt thì đẩy lại hàng đợi, hết lượt thì đánh failed."""
+    attempt = (task.attempt or 0) + 1
+    if attempt < MAX_ATTEMPTS:
+        await update_task_status(
+            db, task.id, TASK_STATUS_PENDING, attempt=attempt, error=error[:2000]
+        )
+        await db.commit()
+        await r.zadd(queue, {str(task.id): time.time() + 30})
+        log.warning("Task %s lỗi (lần %s/%s), sẽ thử lại: %s", task.id, attempt, MAX_ATTEMPTS, error)
+        return
+
+    await update_task_status(db, task.id, TASK_STATUS_FAILED, attempt=attempt, error=error[:2000])
+    await refresh_job_counters(db, task.job_id)
+    await db.commit()
+    stats.total_failed += 1
+    log.error("Task %s failed sau %s lần: %s", task.id, attempt, error)
+    await enqueue_progress(
+        r,
+        {
+            "worker_id": WORKER_ID,
+            "type": "task_failed",
+            "task_id": task.id,
+            "job_id": task.job_id,
+            "error": error[:300],
+        },
+    )
 
 
-async def try_acquire_lock(r: aioredis.Redis, lock_key: str, ttl_sec: int = 3600) -> bool:
-    # simple SET NX
-    ok = await r.set(lock_key, WORKER_ID, nx=True, ex=ttl_sec)
-    return bool(ok)
+def make_progress_cb(r: aioredis.Redis, kind: str, task_id: int, job_id: int, stats: WorkerStats):
+    """Progress callback có throttle — không spam Redis mỗi chunk."""
+    state = {"last": 0.0, "start": time.time()}
+
+    async def _cb(current: int, total: int):
+        now = time.time()
+        if now - state["last"] < PROGRESS_INTERVAL and current != total:
+            return
+        state["last"] = now
+        speed = current / max(0.001, now - state["start"])
+        if kind == "dl":
+            stats.dl_speed = speed
+        else:
+            stats.up_speed = speed
+        await enqueue_progress(
+            r,
+            {
+                "worker_id": WORKER_ID,
+                "type": kind,
+                "task_id": task_id,
+                "job_id": job_id,
+                "current": current,
+                "total": total,
+                "speed": speed,
+            },
+        )
+
+    return _cb
 
 
-async def enqueue_progress(r: aioredis.Redis, payload: dict):
-    # payload is JSON string
-    await r.publish(PUBSUB_PROGRESS, pub_progress(payload))
+# --------------------------------------------------------------------------
+# Download
+# --------------------------------------------------------------------------
+async def _handle_download(
+    app: Client,
+    r: aioredis.Redis,
+    db: AsyncSession,
+    dl_sem: AdaptiveSemaphore,
+    stats: WorkerStats,
+    task_id: int,
+):
+    task = await db.get(Task, task_id)
+    if not task:
+        log.warning("Task %s không tồn tại, bỏ qua", task_id)
+        return
+    if task.status in (TASK_STATUS_CANCELLED, TASK_STATUS_DONE):
+        return
 
+    job = await db.get(Job, task.job_id)
+    if not job:
+        await update_task_status(db, task_id, TASK_STATUS_FAILED, error="Job không tồn tại")
+        await db.commit()
+        return
+    if job.status == JOB_STATUS_CANCELLED:
+        await update_task_status(db, task_id, TASK_STATUS_CANCELLED)
+        await db.commit()
+        return
 
-async def download_worker(app: Client, r: aioredis.Redis, db: AsyncSession, dl_sem: AdaptiveSemaphore, up_queue: asyncio.Queue, stop_event: asyncio.Event):
-    while not stop_event.is_set():
-        # Take next download task from ZSET by priority
-        # Using ZPOPMIN (Redis >=5). If not available in your redis, we fall back later.
-        item = await r.zpopmin(QUEUE_DOWNLOAD, count=1)
-        if not item:
-            await asyncio.sleep(0.2)
-            continue
+    await update_task_status(db, task_id, TASK_STATUS_DOWNLOADING, worker_id=WORKER_ID, error=None)
+    await db.commit()
+    stats.current_task = task_id
 
-        # item = [(member, score)] but encoding depends; normalize
-        member, _score = item[0]
-        if isinstance(member, bytes):
-            member = member.decode("utf-8")
-        task_id = int(member)
+    try:
+        # job.src_link là chuỗi ("-1001234..." hoặc link t.me). Truyền thẳng cho
+        # Pyrogram sẽ bị hiểu là username -> PEER_ID_INVALID.
+        src_peer = normalize_peer(job.src_link)
+        msg = await app.get_messages(src_peer, task.msg_id)
+        if not msg or getattr(msg, "empty", False):
+            raise RuntimeError(f"Không lấy được message {task.msg_id} từ {job.src_link}")
+        if not is_supported_media(msg):
+            raise RuntimeError(f"Message {task.msg_id} không phải media hỗ trợ")
 
-        # verify task state
-        t = await db.get(Task, task_id)
-        if not t:
-            continue
-        if t.status in (TASK_STATUS_CANCELLED, TASK_STATUS_DONE, TASK_STATUS_FAILED):
-            continue
+        media_kind = get_media_kind(msg)
+        # Tên file có prefix job_id: cùng msg_id ở 2 job khác nhau sẽ không ghi đè nhau
+        filename = task.filename or f"{job.id}_{task.msg_id}{get_media_extension(msg)}"
+        local_path = os.path.join(DOWNLOAD_DIR, filename)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        # distributed lock
-        lock_key = f"{LOCK_PREFIX}{task_id}"
-        got = await try_acquire_lock(r, lock_key)
-        if not got:
-            # someone else processing
-            await r.zadd(QUEUE_DOWNLOAD, {str(task_id): int(time.time())})
-            continue
-
+        stats.active_dl += 1
         try:
-            await update_task_status(db, task_id, TASK_STATUS_DOWNLOADING)
-            await db.commit()
-
-            # Download using saved filename/path in Task
-            # Note: Task must contain enough info. In current DB model, caption/filename/file_path exist.
-            # We'll assume Task.filename holds a deterministic desired filename.
-            filename = t.filename or f"{task_id}.mp4"
-            local_path = os.path.join(DOWNLOAD_DIR, filename)
-
-            # app.download_media expects a message reference; our Task only has msg_id/job_id.
-            # We need source/dst resolution from Job stored in DB.
-            job = await db.get(Job, t.job_id)
-            if not job:
-                raise RuntimeError("Job not found")
-
-            src_chat = job.src_link  # for real system we should store chat id; for now keep link
-            msg = await app.get_messages(src_chat, t.msg_id)
-            if not msg or not is_supported_media(msg):
-                raise RuntimeError("Message is not a supported media message")
-
-            await asyncio.sleep(0)  # yield
-
-            async def dl_progress(current, total):
-                await enqueue_progress(r, {
-                    "worker_id": WORKER_ID,
-                    "type": "dl",
-                    "task_id": task_id,
-                    "current": current,
-                    "total": total,
-                })
-
             async with dl_sem:
                 start = time.time()
                 path = await app.download_media(
                     msg,
                     file_name=local_path,
-                    progress=dl_progress,
+                    progress=make_progress_cb(r, "dl", task_id, job.id, stats),
                 )
-                elapsed = max(0.001, time.time() - start)
-                speed = os.path.getsize(path) / elapsed if os.path.exists(path) else 0
-
-            await update_task_status(db, task_id, TASK_STATUS_UPLOADING, file_path=path, speed_dl=speed)
-            await db.commit()
-
-            # push to upload queue for this worker process
-            await up_queue.put(task_id)
-
-            await enqueue_progress(r, {"worker_id": WORKER_ID, "type": "dl_done", "task_id": task_id})
-
-        except asyncio.CancelledError:
-            raise
-        except FloodWait as e:
-            wait = int(e.value) + 1
-            # requeue
-            await update_task_status(db, task_id, TASK_STATUS_PENDING)
-            await db.commit()
-            await asyncio.sleep(wait)
-            await r.zadd(QUEUE_DOWNLOAD, {str(task_id): 999999999})
-        except Exception as e:
-            await update_task_status(db, task_id, TASK_STATUS_FAILED, error=str(e))
-            await db.commit()
         finally:
-            # release lock by deleting
-            try:
-                await r.delete(lock_key)
-            except Exception:
-                pass
+            stats.active_dl -= 1
+
+        # download_media nuốt exception và trả None khi tải lỗi
+        if not path or not os.path.exists(path):
+            raise RuntimeError("Tải file thất bại (Pyrogram trả về None)")
+
+        elapsed = max(0.001, time.time() - start)
+        size = os.path.getsize(path)
+        speed = size / elapsed
+        stats.dl_speed = speed
+
+        await update_task_status(
+            db,
+            task_id,
+            TASK_STATUS_UPLOADING,
+            file_path=path,
+            filename=os.path.basename(path),
+            media_kind=media_kind,
+            speed_dl=speed,
+            size_bytes=size or get_media_size(msg),
+            downloaded_bytes=size,
+            caption=(msg.caption or task.caption or "")[:CAPTION_LIMIT],
+        )
+        await db.commit()
+
+        # Đẩy sang hàng đợi upload dùng chung -> worker nào rảnh cũng upload được
+        await r.zadd(QUEUE_UPLOAD, {str(task_id): time.time()})
+        await enqueue_progress(
+            r, {"worker_id": WORKER_ID, "type": "dl_done", "task_id": task_id, "job_id": job.id}
+        )
+        log.info("Tải xong task %s (%.1f MB, %.2f MB/s)", task_id, size / (1 << 20), speed / (1 << 20))
+
+    except FloodWait as e:
+        wait = int(getattr(e, "value", 30)) + 1
+        log.warning("FloodWait %ss khi tải task %s", wait, task_id)
+        await db.rollback()
+        await update_task_status(db, task_id, TASK_STATUS_PENDING)
+        await db.commit()
+        await r.zadd(QUEUE_DOWNLOAD, {str(task_id): time.time() + wait})
+    except asyncio.CancelledError:
+        await db.rollback()
+        await r.zadd(QUEUE_DOWNLOAD, {str(task_id): time.time()})
+        raise
+    except Exception as e:
+        await db.rollback()
+        task = await db.get(Task, task_id)
+        if task:
+            await fail_or_retry(r, db, task, QUEUE_DOWNLOAD, f"{type(e).__name__}: {e}", stats)
+    finally:
+        stats.current_task = None
 
 
-async def upload_worker(app: Client, r: aioredis.Redis, db: AsyncSession, up_sem: AdaptiveSemaphore, up_queue: asyncio.Queue, stop_event: asyncio.Event):
+async def _next_queue_item(r: aioredis.Redis, queue: str) -> Optional[int]:
+    """Lấy task kế tiếp từ ZSET, tôn trọng score dùng làm 'không chạy trước lúc'."""
+    item = await r.zpopmin(queue, count=1)
+    if not item:
+        return None
+
+    member, score = item[0]
+    if isinstance(member, bytes):
+        member = member.decode("utf-8")
+    try:
+        task_id = int(member)
+    except ValueError:
+        return None
+
+    if float(score) > time.time():
+        # chưa tới lượt (retry/FloodWait) -> trả lại hàng đợi
+        await r.zadd(queue, {member: score})
+        await asyncio.sleep(0.5)
+        return None
+    return task_id
+
+
+async def download_worker(
+    app: Client,
+    r: aioredis.Redis,
+    dl_sem: AdaptiveSemaphore,
+    stop_event: asyncio.Event,
+    stats: WorkerStats,
+):
     while not stop_event.is_set():
         try:
-            task_id = await asyncio.wait_for(up_queue.get(), timeout=0.5)
-        except asyncio.TimeoutError:
+            task_id = await _next_queue_item(r, QUEUE_DOWNLOAD)
+        except Exception as exc:
+            log.warning("Đọc queue download lỗi: %s", exc)
+            await asyncio.sleep(1)
             continue
 
-        t = await db.get(Task, task_id)
-        if not t:
-            up_queue.task_done()
-            continue
-        if t.status == TASK_STATUS_CANCELLED:
-            up_queue.task_done()
+        if task_id is None:
+            await asyncio.sleep(0.3)
             continue
 
         lock_key = f"{LOCK_PREFIX}{task_id}"
-        # reuse lock not strictly needed for upload because we have download lock lifecycle,
-        # but keep a best-effort lock.
-        await try_acquire_lock(r, lock_key, ttl_sec=3600)
+        if not await try_acquire_lock(r, lock_key):
+            # worker khác đang giữ task này -> hoãn lại, tránh vòng lặp nóng
+            await r.zadd(QUEUE_DOWNLOAD, {str(task_id): time.time() + 30})
+            await asyncio.sleep(0.5)
+            continue
 
         try:
-            await update_task_status(db, task_id, TASK_STATUS_UPLOADING)
-            await db.commit()
+            # Session mới cho mỗi task: tránh identity-map trả về dữ liệu cũ và
+            # tránh transaction hỏng lây sang task kế tiếp.
+            async with AsyncSessionLocal() as db:
+                await _handle_download(app, r, db, dl_sem, stats, task_id)
+        except asyncio.CancelledError:
+            await release_lock(r, lock_key)
+            raise
+        except Exception as exc:
+            log.exception("download_worker lỗi ngoài dự kiến ở task %s: %s", task_id, exc)
+        finally:
+            await release_lock(r, lock_key)
 
-            job = await db.get(Job, t.job_id)
-            if not job:
-                raise RuntimeError("Job not found")
 
-            dst_chat = job.dst_link
-            caption = t.caption or ""
-            path = t.file_path
-            if not path or not os.path.exists(path):
-                raise RuntimeError(f"File not found: {path}")
+# --------------------------------------------------------------------------
+# Upload
+# --------------------------------------------------------------------------
+async def _send_media(
+    app: Client,
+    dst_peer: Union[int, str],
+    kind: str,
+    path: str,
+    caption: str,
+    progress,
+):
+    if kind == "video":
+        return await app.send_video(
+            dst_peer, video=path, caption=caption, supports_streaming=True, progress=progress
+        )
+    if kind == "photo":
+        return await app.send_photo(dst_peer, photo=path, caption=caption, progress=progress)
+    if kind == "audio":
+        return await app.send_audio(dst_peer, audio=path, caption=caption, progress=progress)
+    return await app.send_document(dst_peer, document=path, caption=caption, progress=progress)
 
-            async def up_progress(current, total):
-                await enqueue_progress(r, {
-                    "worker_id": WORKER_ID,
-                    "type": "up",
-                    "task_id": task_id,
-                    "current": current,
-                    "total": total,
-                })
 
+async def _mark_transferred(db: AsyncSession, job_id: int, msg_id: int):
+    """Ghi lịch sử đã chuyển, an toàn với bản ghi trùng."""
+    existing = await db.get(Transferred, (job_id, msg_id))
+    if existing:
+        return
+    try:
+        async with db.begin_nested():
+            db.add(Transferred(job_id=job_id, msg_id=msg_id))
+            # flush trong savepoint để IntegrityError bị bắt tại đây,
+            # không làm hỏng transaction chính lúc commit
+            await db.flush()
+    except Exception as exc:  # race giữa 2 worker
+        log.debug("Transferred đã tồn tại (%s/%s): %s", job_id, msg_id, exc)
+
+
+async def _handle_upload(
+    app: Client,
+    r: aioredis.Redis,
+    db: AsyncSession,
+    up_sem: AdaptiveSemaphore,
+    stats: WorkerStats,
+    task_id: int,
+):
+    task = await db.get(Task, task_id)
+    if not task:
+        return
+    if task.status in (TASK_STATUS_CANCELLED, TASK_STATUS_DONE):
+        return
+
+    job = await db.get(Job, task.job_id)
+    if not job:
+        await update_task_status(db, task_id, TASK_STATUS_FAILED, error="Job không tồn tại")
+        await db.commit()
+        return
+    if job.status == JOB_STATUS_CANCELLED:
+        await update_task_status(db, task_id, TASK_STATUS_CANCELLED)
+        await db.commit()
+        return
+
+    path = task.file_path
+    if not path or not os.path.exists(path):
+        # file mất -> tải lại từ đầu thay vì fail thẳng
+        await fail_or_retry(
+            r, db, task, QUEUE_DOWNLOAD, f"File không tồn tại để upload: {path}", stats
+        )
+        return
+
+    await update_task_status(db, task_id, TASK_STATUS_UPLOADING, worker_id=WORKER_ID)
+    await db.commit()
+    stats.current_task = task_id
+
+    try:
+        dst_peer = normalize_peer(job.dst_link)
+        caption = (task.caption or "")[:CAPTION_LIMIT]
+        kind = task.media_kind or guess_kind_from_path(path)
+
+        stats.active_up += 1
+        try:
             async with up_sem:
                 start = time.time()
-                await app.send_video(
-                    dst_chat,
-                    video=path,
-                    caption=caption,
-                    supports_streaming=True,
-                    progress=up_progress,
+                await _send_media(
+                    app,
+                    dst_peer,
+                    kind,
+                    path,
+                    caption,
+                    make_progress_cb(r, "up", task_id, job.id, stats),
                 )
-                elapsed = max(0.001, time.time() - start)
-                speed = os.path.getsize(path) / elapsed if os.path.exists(path) else 0
+        finally:
+            stats.active_up -= 1
 
-            await update_task_status(db, task_id, TASK_STATUS_DONE, speed_up=speed, updated_at=time.time())
-            await db.commit()
+        elapsed = max(0.001, time.time() - start)
+        size = os.path.getsize(path) if os.path.exists(path) else (task.size_bytes or 0)
+        speed = size / elapsed
+        stats.up_speed = speed
 
-            # store transferred history
-            # msg_id in Task
-            db_obj = await db.get(Transferred, t.msg_id)
-            if not db_obj:
-                db.add(Transferred(msg_id=t.msg_id, job_id=t.job_id))
-                await db.commit()
+        # LƯU Ý: updated_at là cột DateTime. Truyền time.time() (float) vào đây
+        # sẽ ném lỗi ở tầng driver, rồi commit trong except gây PendingRollbackError
+        # và giết luôn vòng lặp upload — đó là lý do upload "im lặng" không chạy.
+        await update_task_status(db, task_id, TASK_STATUS_DONE, speed_up=speed, error=None)
+        await _mark_transferred(db, task.job_id, task.msg_id)
+        await refresh_job_counters(db, task.job_id)
+        await db.commit()
 
-            # optionally delete file
+        stats.total_done += 1
+
+        if DELETE_AFTER_UPLOAD:
             try:
                 os.remove(path)
-            except Exception:
+            except OSError:
                 pass
 
-            await enqueue_progress(r, {"worker_id": WORKER_ID, "type": "up_done", "task_id": task_id})
+        await enqueue_progress(
+            r, {"worker_id": WORKER_ID, "type": "up_done", "task_id": task_id, "job_id": job.id}
+        )
+        log.info("Upload xong task %s (%.2f MB/s)", task_id, speed / (1 << 20))
 
-        except Exception as e:
-            await update_task_status(db, task_id, TASK_STATUS_FAILED, error=str(e))
-            await db.commit()
-        finally:
-            try:
-                await r.delete(lock_key)
-            except Exception:
-                pass
-            up_queue.task_done()
+    except FloodWait as e:
+        wait = int(getattr(e, "value", 30)) + 1
+        log.warning("FloodWait %ss khi upload task %s", wait, task_id)
+        await db.rollback()
+        await update_task_status(db, task_id, TASK_STATUS_UPLOADING)
+        await db.commit()
+        await r.zadd(QUEUE_UPLOAD, {str(task_id): time.time() + wait})
+    except asyncio.CancelledError:
+        await db.rollback()
+        await r.zadd(QUEUE_UPLOAD, {str(task_id): time.time()})
+        raise
+    except Exception as e:
+        await db.rollback()
+        task = await db.get(Task, task_id)
+        if task:
+            await fail_or_retry(r, db, task, QUEUE_UPLOAD, f"{type(e).__name__}: {e}", stats)
+    finally:
+        stats.current_task = None
 
 
-async def new_job_consumer(app: Client, r: aioredis.Redis, dl_sem: AdaptiveSemaphore, stop_event: asyncio.Event):
-    log.info("Starting new_job_consumer loop")
+async def upload_worker(
+    app: Client,
+    r: aioredis.Redis,
+    up_sem: AdaptiveSemaphore,
+    stop_event: asyncio.Event,
+    stats: WorkerStats,
+):
     while not stop_event.is_set():
-        log.info(f"Polling queue:new_job")
-        payload = await r.brpop("queue:new_job", timeout=2)
-        log.info(f"BRPOP returned: {payload}")
+        try:
+            task_id = await _next_queue_item(r, QUEUE_UPLOAD)
+        except Exception as exc:
+            log.warning("Đọc queue upload lỗi: %s", exc)
+            await asyncio.sleep(1)
+            continue
+
+        if task_id is None:
+            await asyncio.sleep(0.3)
+            continue
+
+        lock_key = f"{LOCK_PREFIX}{task_id}"
+        if not await try_acquire_lock(r, lock_key):
+            await r.zadd(QUEUE_UPLOAD, {str(task_id): time.time() + 30})
+            await asyncio.sleep(0.5)
+            continue
+
+        try:
+            async with AsyncSessionLocal() as db:
+                await _handle_upload(app, r, db, up_sem, stats, task_id)
+        except asyncio.CancelledError:
+            await release_lock(r, lock_key)
+            raise
+        except Exception as exc:
+            log.exception("upload_worker lỗi ngoài dự kiến ở task %s: %s", task_id, exc)
+        finally:
+            await release_lock(r, lock_key)
+
+
+# --------------------------------------------------------------------------
+# Nhận job mới từ API
+# --------------------------------------------------------------------------
+async def _iter_messages(app: Client, peer, start: int, end: int):
+    """Lấy message theo lô 200 id — nhanh hơn rất nhiều so với gọi từng cái."""
+    ids = list(range(start, end + 1))
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        try:
+            messages = await app.get_messages(peer, chunk)
+        except FloodWait as e:
+            await asyncio.sleep(int(getattr(e, "value", 30)) + 1)
+            try:
+                messages = await app.get_messages(peer, chunk)
+            except RPCError as exc:
+                log.error("get_messages lỗi cho lô %s-%s: %s", chunk[0], chunk[-1], exc)
+                continue
+        except RPCError as exc:
+            log.error("get_messages lỗi cho lô %s-%s: %s", chunk[0], chunk[-1], exc)
+            continue
+        for msg in messages or []:
+            yield msg
+
+
+async def _create_task_row(db: AsyncSession, r: aioredis.Redis, job_id: int, msg) -> bool:
+    existing = await db.execute(
+        select(Task.id).where(Task.job_id == job_id, Task.msg_id == msg.id).limit(1)
+    )
+    if existing.scalars().first():
+        return False
+
+    task = Task(
+        job_id=job_id,
+        msg_id=msg.id,
+        caption=(msg.caption or "")[:CAPTION_LIMIT],
+        status=TASK_STATUS_PENDING,
+        filename=f"{job_id}_{msg.id}{get_media_extension(msg)}",
+        media_kind=get_media_kind(msg),
+        size_bytes=get_media_size(msg),
+        worker_id=None,
+    )
+    db.add(task)
+    try:
+        await db.flush()
+        await db.commit()
+    except Exception as exc:  # unique constraint -> worker khác đã tạo
+        await db.rollback()
+        log.debug("Task đã tồn tại (job=%s msg=%s): %s", job_id, msg.id, exc)
+        return False
+
+    await r.zadd(QUEUE_DOWNLOAD, {str(task.id): 0})
+    return True
+
+
+async def _resolve_job_chats(app: Client, db: AsyncSession, r: aioredis.Redis, job_id: int, src_peer, dst_peer) -> bool:
+    """Kiểm tra quyền truy cập 2 chat trước, báo lỗi sớm thay vì fail từng task."""
+    titles = {}
+    for field, peer in (("src_title", src_peer), ("dst_title", dst_peer)):
+        try:
+            chat = await app.get_chat(peer)
+            titles[field] = (
+                getattr(chat, "title", None) or getattr(chat, "username", None) or str(peer)
+            )[:255]
+        except Exception as exc:
+            log.error("Job %s: không truy cập được chat %r: %s", job_id, peer, exc)
+            await db.execute(
+                update(Job).where(Job.id == job_id).values(status=JOB_STATUS_CANCELLED)
+            )
+            await db.commit()
+            await enqueue_progress(
+                r,
+                {
+                    "worker_id": WORKER_ID,
+                    "type": "job_error",
+                    "job_id": job_id,
+                    "error": f"Không truy cập được {peer}: {exc}",
+                },
+            )
+            return False
+
+    await db.execute(update(Job).where(Job.id == job_id).values(**titles))
+    await db.commit()
+    return True
+
+
+async def _process_new_job(app: Client, r: aioredis.Redis, job_req: dict, stop_event: asyncio.Event):
+    job_id = int(job_req["job_id"])
+    from_msg_id = job_req.get("from_msg_id")
+    to_msg_id = job_req.get("to_msg_id")
+
+    try:
+        src_peer = normalize_peer(job_req["src_link"])
+        dst_peer = normalize_peer(job_req["dst_link"])
+    except ValueError as exc:
+        log.error("Job %s có link không hợp lệ: %s", job_id, exc)
+        return
+
+    log.info("Job %s: src=%r dst=%r range=%s..%s", job_id, src_peer, dst_peer, from_msg_id, to_msg_id)
+
+    async with AsyncSessionLocal() as db:
+        if not await _resolve_job_chats(app, db, r, job_id, src_peer, dst_peer):
+            return
+
+        res = await db.execute(select(Transferred.msg_id).where(Transferred.job_id == job_id))
+        transferred_ids = {int(x[0]) for x in res.all() if x and x[0] is not None}
+
+        created = 0
+        if from_msg_id is not None and to_msg_id is not None:
+            start = int(min(from_msg_id, to_msg_id))
+            end = int(max(from_msg_id, to_msg_id))
+            async for msg in _iter_messages(app, src_peer, start, end):
+                if stop_event.is_set():
+                    break
+                if not msg or getattr(msg, "empty", False):
+                    continue
+                if int(msg.id) in transferred_ids or not is_supported_media(msg):
+                    continue
+                if await _create_task_row(db, r, job_id, msg):
+                    created += 1
+        else:
+            scanned = 0
+            async for msg in app.get_chat_history(src_peer, limit=SCAN_CAP):
+                if stop_event.is_set() or scanned >= SCAN_CAP:
+                    break
+                scanned += 1
+                if not msg or getattr(msg, "empty", False):
+                    continue
+                if int(msg.id) in transferred_ids or not is_supported_media(msg):
+                    continue
+                if await _create_task_row(db, r, job_id, msg):
+                    created += 1
+
+        await refresh_job_counters(db, job_id)
+        await db.commit()
+
+    log.info("Job %s: tạo %s task", job_id, created)
+    await enqueue_progress(
+        r, {"worker_id": WORKER_ID, "type": "job_enqueued", "job_id": job_id, "created": created}
+    )
+
+
+async def new_job_consumer(app: Client, r: aioredis.Redis, stop_event: asyncio.Event):
+    log.info("new_job_consumer sẵn sàng")
+    while not stop_event.is_set():
+        try:
+            payload = await r.brpop(QUEUE_NEW_JOB, timeout=2)
+        except Exception as exc:
+            log.warning("BRPOP lỗi: %s", exc)
+            await asyncio.sleep(1)
+            continue
         if not payload:
             continue
+
         _queue, raw = payload
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
         try:
             job_req = json.loads(raw)
-            log.info(f"Parsed job_req: {job_req}")
-        except Exception as e:
-            log.error(f"Failed to parse job JSON: {e}")
+        except Exception as exc:
+            log.error("Job JSON hỏng: %s", exc)
             continue
 
-        job_id = int(job_req["job_id"])
-        log.info(f"Processing job {job_id}")
-        # from/to optional: if missing, we will scan recent history until we hit a reasonable limit.
-        from_msg_id = job_req.get("from_msg_id")
-        to_msg_id = job_req.get("to_msg_id")
-        log.info(f"from_msg_id={from_msg_id}, to_msg_id={to_msg_id}")
+        try:
+            await _process_new_job(app, r, job_req, stop_event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Xử lý job mới thất bại: %s", exc)
 
-        # resolve chats (links) via Pyrogram
-        src_peer = job_req["src_link"]
-        dst_peer = job_req["dst_link"]
-        # Convert numeric string to int for Telegram API
-        if isinstance(src_peer, str) and src_peer.startswith("-") and src_peer.lstrip("-").isdigit():
-            src_peer = int(src_peer)
 
-        # Use a fresh db session
-        log.info(f"Getting DB session for job {job_id}")
-        async for db in _db_session_iter():
-            log.info(f"Got DB session")
-            transferred_ids = set()
-            try:
-                res = await db.execute(select(Transferred.msg_id).where(Transferred.job_id == job_id))
-                transferred_ids = {int(x[0]) for x in res.all() if x and x[0] is not None}
-                log.info(f"transferred_ids: {transferred_ids}")
-            except Exception as e:
-                log.error(f"DB error for job {job_id}: {e}")
-                break
+# --------------------------------------------------------------------------
+# Janitor: cứu task bị kẹt khi worker chết giữa chừng
+# --------------------------------------------------------------------------
+async def _requeue_orphans(r: aioredis.Redis):
+    """Task ở trạng thái downloading/uploading nhưng không còn lock -> worker đã chết."""
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            select(Task.id, Task.status).where(
+                Task.status.in_([TASK_STATUS_DOWNLOADING, TASK_STATUS_UPLOADING])
+            )
+        )
+        recovered = 0
+        for task_id, status in res.all():
+            if await r.exists(f"{LOCK_PREFIX}{task_id}"):
+                continue
+            in_dl = await r.zscore(QUEUE_DOWNLOAD, str(task_id))
+            in_up = await r.zscore(QUEUE_UPLOAD, str(task_id))
+            if in_dl is not None or in_up is not None:
+                continue
 
-            # Decide scanning range strategy
-            # If both provided => scan in [from,to]
-            # Else => scan a capped amount from newest backwards
-            cap_messages = 200  # configurable later if needed
-
-            created_count = 0
-            if from_msg_id is not None and to_msg_id is not None:
-                log.info(f"Entered range branch")
-                start = int(min(from_msg_id, to_msg_id))
-                end = int(max(from_msg_id, to_msg_id))
-                log.info(f"Range: {start} to {end}")
-                for msg_id in range(start, end + 1):
-                    log.info(f"Checking msg_id {msg_id}")
-                    if stop_event.is_set():
-                        break
-                    if msg_id in transferred_ids:
-                        continue
-
-                    try:
-                        log.info(f"Calling get_messages({src_peer}, {msg_id})")
-                        msg = await app.get_messages(src_peer, msg_id)
-                        log.info(f"Got message: {msg is not None}")
-                    except Exception as e:
-                        log.error(f"get_messages error for {msg_id}: {e}")
-                        continue
-
-                    if not msg:
-                        log.info(f"msg is None for {msg_id}")
-                        continue
-                    if not is_supported_media(msg):
-                        log.info(f"unsupported media for {msg_id}, content_type={type(msg).__name__}")
-                        continue
-
-                    # caption
-                    caption = msg.caption or ""
-
-                    # Insert Task if not exists
-                    existing = await db.execute(
-                        select(Task).where(Task.job_id == job_id, Task.msg_id == msg_id).limit(1)
-                    )
-                    if existing.scalars().first():
-                        continue
-
-                    media = getattr(msg, "video", None) or getattr(msg, "document", None) or getattr(msg, "photo", None)
-                    t = Task(
-                        job_id=job_id,
-                        msg_id=msg_id,
-                        caption=caption,
-                        status=TASK_STATUS_PENDING,
-                        filename=f"{msg_id}{get_media_extension(msg)}",
-                        worker_id=WORKER_ID,
-                        size_bytes=getattr(media, "file_size", 0) or 0,
-                    )
-                    db.add(t)
-                    await db.flush()
-                    await db.commit()
-
-                    # Lower score => higher priority download
-                    await r.zadd(QUEUE_DOWNLOAD, {str(t.id): 0})
-                    created_count += 1
+            if status == TASK_STATUS_UPLOADING:
+                await r.zadd(QUEUE_UPLOAD, {str(task_id): time.time()})
             else:
-                # scan recent history limited by cap_messages
-                scanned = 0
-                async for msg in app.get_chat_history(src_peer, limit=cap_messages):
-                    if stop_event.is_set():
-                        break
-                    if scanned >= cap_messages:
-                        break
-                    scanned += 1
+                await update_task_status(db, task_id, TASK_STATUS_PENDING)
+                await r.zadd(QUEUE_DOWNLOAD, {str(task_id): time.time()})
+            recovered += 1
 
-                    if not msg or not is_supported_media(msg):
-                        continue
-                    if int(msg.id) in transferred_ids:
-                        continue
-
-                    existing = await db.execute(
-                        select(Task).where(Task.job_id == job_id, Task.msg_id == msg.id).limit(1)
-                    )
-                    if existing.scalars().first():
-                        continue
-
-                    caption = msg.caption or ""
-                    t = Task(
-                        job_id=job_id,
-                        msg_id=msg.id,
-                        caption=caption,
-                        status=TASK_STATUS_PENDING,
-                        filename=f"{msg.id}.mp4",
-                        worker_id=WORKER_ID,
-                    )
-                    db.add(t)
-                    await db.flush()
-                    await db.commit()
-                    await r.zadd(QUEUE_DOWNLOAD, {str(t.id): 0})
-                    created_count += 1
-
-            # best-effort: update job status to cancelled check is not implemented in this skeleton
-            await enqueue_progress(r, {"worker_id": WORKER_ID, "type": "job_enqueued", "job_id": job_id, "created": created_count})
-            break
+        if recovered:
+            await db.commit()
+            log.info("Janitor đưa lại %s task bị kẹt vào hàng đợi", recovered)
 
 
-async def _db_session_iter():
-    # helper yields one session
-    from api.database import AsyncSessionLocal
-    async with AsyncSessionLocal() as session:
-        yield session
+async def janitor_loop(r: aioredis.Redis, stop_event: asyncio.Event):
+    while not stop_event.is_set():
+        try:
+            # chỉ 1 worker chạy janitor mỗi phút
+            if await try_acquire_lock(r, JANITOR_LOCK, ttl_sec=55):
+                await _requeue_orphans(r)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("janitor lỗi: %s", exc)
+        await asyncio.sleep(60)
 
 
-async def _read_session_file() -> str | None:
+# --------------------------------------------------------------------------
+# Auth
+# --------------------------------------------------------------------------
+def _write_session_file(session_str: str):
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        f.write(session_str)
+
+
+def _read_session_file() -> Optional[str]:
     try:
-        with open(SESSION_FILE, "r") as f:
-            return f.read().strip()
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip() or None
     except (FileNotFoundError, IOError):
         return None
 
 
-def _write_session_file(session_str: str):
-    os.makedirs(SESSION_DIR, exist_ok=True)
-    with open(SESSION_FILE, "w") as f:
-        f.write(session_str)
+async def _load_session(r: aioredis.Redis) -> Optional[str]:
+    if SESSION_STRING_ENV:
+        return SESSION_STRING_ENV
+    session = await r.get(AUTH_SESSION_KEY)
+    if isinstance(session, bytes):
+        session = session.decode("utf-8")
+    if session:
+        return session
+    session = _read_session_file()
+    if session:
+        # session không nên có TTL: hết hạn key là toàn bộ worker mất auth
+        await r.set(AUTH_SESSION_KEY, session)
+    return session
 
 
-async def wait_for_session(r: aioredis.Redis, stop_event: asyncio.Event) -> str:
-    """Wait for session string to be available from Redis or file."""
+async def wait_for_session(r: aioredis.Redis, stop_event: asyncio.Event) -> Optional[str]:
     while not stop_event.is_set():
-        # Check Redis first (shared session)
-        session = await r.get(AUTH_SESSION_KEY)
+        session = await _load_session(r)
         if session:
-            if isinstance(session, bytes):
-                session = session.decode("utf-8")
             return session
-        # Check if file exists (persistent volume)
-        try:
-            with open(SESSION_FILE, "r") as f:
-                file_session = f.read().strip()
-                if file_session:
-                    await r.set(AUTH_SESSION_KEY, file_session, ex=86400)
-                    return file_session
-        except (FileNotFoundError, IOError):
-            pass
         await asyncio.sleep(1)
-    raise RuntimeError("stop_event set while waiting for session")
+    return None
 
 
+async def run_auth_master(r: aioredis.Redis, stop_event: asyncio.Event) -> Optional[str]:
+    """Worker giữ AUTH_LOCK sẽ nhận số điện thoại/OTP từ web và tạo session."""
+    log.info("Worker %s làm auth master — chờ OTP từ web", WORKER_ID)
+    session_str = None
+    app = Client(f"tgcopy_auth_{WORKER_ID}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
+    await app.connect()
+    try:
+        while not stop_event.is_set() and not session_str:
+            # gia hạn lock, tránh worker khác cũng nhảy vào làm master
+            await r.expire(AUTH_LOCK_KEY, 300)
+
+            req_payload = await r.brpop(AUTH_OTP_REQ_QUEUE, timeout=2)
+            if req_payload:
+                _, raw = req_payload
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                try:
+                    phone = json.loads(raw).get("phone_number", "")
+                    if phone:
+                        sent = await app.send_code(phone)
+                        await r.set(f"auth:phone_code_hash:{phone}", sent.phone_code_hash, ex=300)
+                        await r.delete(AUTH_ERROR_KEY)
+                        log.info("Đã gửi OTP tới %s", phone)
+                except Exception as exc:
+                    log.error("Gửi OTP lỗi: %s", exc)
+                    await r.set(AUTH_ERROR_KEY, f"Gửi OTP lỗi: {exc}", ex=300)
+
+            verify_payload = await r.brpop(AUTH_OTP_QUEUE, timeout=1)
+            if not verify_payload:
+                continue
+
+            _, raw = verify_payload
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            try:
+                data = json.loads(raw)
+                phone = data.get("phone_number", "")
+                otp = data.get("otp", "")
+                password = data.get("password") or ""
+                if not (phone and otp):
+                    continue
+
+                phone_code_hash = await r.get(f"auth:phone_code_hash:{phone}")
+                if not phone_code_hash:
+                    await r.set(AUTH_ERROR_KEY, "OTP hết hạn, hãy gửi lại mã", ex=300)
+                    continue
+                if isinstance(phone_code_hash, bytes):
+                    phone_code_hash = phone_code_hash.decode("utf-8")
+
+                try:
+                    await app.sign_in(
+                        phone_number=phone, phone_code_hash=phone_code_hash, phone_code=otp
+                    )
+                except Exception as exc:
+                    if type(exc).__name__ == "SessionPasswordNeeded":
+                        if not password:
+                            await r.set(
+                                AUTH_ERROR_KEY, "Tài khoản bật 2FA — cần nhập mật khẩu", ex=300
+                            )
+                            continue
+                        await app.check_password(password)
+                    else:
+                        raise
+
+                session_str = await app.export_session_string()
+                _write_session_file(session_str)
+                await r.set(AUTH_SESSION_KEY, session_str)
+                await r.delete(AUTH_ERROR_KEY)
+                log.info("Đăng nhập thành công, đã lưu session cho %s", phone)
+            except RPCError as exc:
+                log.error("Xác thực OTP lỗi RPC: %s", exc)
+                await r.set(AUTH_ERROR_KEY, f"OTP không hợp lệ: {exc}", ex=300)
+            except Exception as exc:
+                log.error("Xác thực OTP thất bại: %s", exc)
+                await r.set(AUTH_ERROR_KEY, str(exc), ex=300)
+    finally:
+        try:
+            await app.disconnect()
+        except Exception:
+            pass
+        # nhả lock để lần đăng nhập sau không bị kẹt 5 phút
+        await release_lock(r, AUTH_LOCK_KEY)
+    return session_str
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
 async def main():
     r = aioredis.from_url(REDIS_URL, decode_responses=True)
     stop_event = asyncio.Event()
-    session_str = None
 
-    # Check if session already exists (from file or Redis)
-    session_str = await r.get(AUTH_SESSION_KEY)
-    if isinstance(session_str, bytes):
-        session_str = session_str.decode("utf-8")
+    log.info("Khởi động worker %s", WORKER_ID)
+
+    session_str = await _load_session(r)
+    if not session_str and await try_acquire_lock(r, AUTH_LOCK_KEY, ttl_sec=300):
+        session_str = await run_auth_master(r, stop_event)
     if not session_str:
-        try:
-            with open(SESSION_FILE, "r") as f:
-                session_str = f.read().strip()
-                if session_str:
-                    await r.set(AUTH_SESSION_KEY, session_str, ex=86400)
-        except (FileNotFoundError, IOError):
-            pass
-
-    # If no session exists, try to become auth master
-    is_auth_master = False
-    if not session_str:
-        is_auth_master = await try_acquire_lock(r, AUTH_LOCK_KEY, ttl_sec=300)
-
-        if is_auth_master:
-            log.info(f"Worker {WORKER_ID} is auth master - waiting for OTP via web")
-
-            app = Client(
-                f"tgcopy_auth_{WORKER_ID}",
-                api_id=API_ID,
-                api_hash=API_HASH,
-            )
-
-            # Use connect() instead of start() to avoid phone prompt
-            await app.connect()
-            log.info("Client connected in auth master mode")
-
-            # Now wait for OTP requests
-            while not stop_event.is_set() and not session_str:
-                req_payload = await r.brpop(AUTH_OTP_REQ_QUEUE, timeout=2)
-                if req_payload:
-                    _, raw = req_payload
-                    if isinstance(raw, bytes):
-                        raw = raw.decode("utf-8")
-                    try:
-                        req_data = json.loads(raw)
-                        phone = req_data.get("phone_number", "")
-                        if phone:
-                            code = await app.send_code(phone)
-                            await r.set(f"auth:phone_code_hash:{phone}", code.phone_code_hash, ex=300)
-                            log.info(f"OTP sent to {phone}")
-                    except Exception as e:
-                        log.error(f"Failed to send OTP: {e}")
-
-                verify_payload = await r.brpop(AUTH_OTP_QUEUE, timeout=0.5)
-                if verify_payload:
-                    _, raw = verify_payload
-                    if isinstance(raw, bytes):
-                        raw = raw.decode("utf-8")
-                    try:
-                        req_data = json.loads(raw)
-                        req_phone = req_data.get("phone_number", "")
-                        otp = req_data.get("otp", "")
-                        if req_phone and otp:
-                            phone_code_hash = await r.get(f"auth:phone_code_hash:{req_phone}")
-                            if phone_code_hash:
-                                if isinstance(phone_code_hash, bytes):
-                                    phone_code_hash = phone_code_hash.decode("utf-8")
-                                await app.sign_in(phone_number=req_phone, phone_code_hash=phone_code_hash, phone_code=otp)
-                                session_str = await app.export_session_string()
-                                if isinstance(session_str, bytes):
-                                    session_str = session_str.decode("utf-8")
-                                _write_session_file(session_str)
-                                await r.set(AUTH_SESSION_KEY, session_str, ex=86400)
-                                log.info(f"Session authenticated and saved for {req_phone}")
-                    except RPCError as e:
-                        log.error(f"OTP verify RPC error: {e}")
-                    except Exception as e:
-                        log.error(f"OTP verify failed: {e}")
-
-            try:
-                await app.disconnect()
-            except Exception:
-                pass
-
-    # Wait for session to be available (for non-master workers or if master failed)
-    if not session_str:
-        log.info(f"Worker {WORKER_ID} waiting for auth session from master")
+        log.info("Worker %s chờ session từ auth master", WORKER_ID)
         session_str = await wait_for_session(r, stop_event)
-
-    if stop_event.is_set():
+    if not session_str or stop_event.is_set():
         return
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
     await init_db()
 
     dl_sem = AdaptiveSemaphore(DEFAULT_MAX_DL)
     up_sem = AdaptiveSemaphore(DEFAULT_MAX_UP)
+    stats = WorkerStats()
 
-    # Telegram client with session
+    # Tên client phải khác nhau giữa các worker để không đụng file session
     app = Client(
-        "tgcopy_worker",
+        f"tgcopy_{WORKER_ID}",
         session_string=session_str,
         api_id=API_ID,
         api_hash=API_HASH,
-        workers=16,
+        workers=int(os.getenv("PYROGRAM_WORKERS", "8")),
+        max_concurrent_transmissions=max(DEFAULT_MAX_DL, DEFAULT_MAX_UP),
+    )
+    await app.start()
+    me = await app.get_me()
+    log.info("Đăng nhập Telegram: %s (id=%s)", me.username or me.first_name, me.id)
+
+    tasks = [
+        asyncio.create_task(heartbeat_loop(r, stats, dl_sem, up_sem), name="heartbeat"),
+        asyncio.create_task(command_listener(r, dl_sem, up_sem, stop_event), name="cmd"),
+        asyncio.create_task(new_job_consumer(app, r, stop_event), name="new_jobs"),
+        asyncio.create_task(janitor_loop(r, stop_event), name="janitor"),
+    ]
+    tasks += [
+        asyncio.create_task(download_worker(app, r, dl_sem, stop_event, stats), name=f"dl-{i}")
+        for i in range(max(1, DEFAULT_MAX_DL))
+    ]
+    tasks += [
+        asyncio.create_task(upload_worker(app, r, up_sem, stop_event, stats), name=f"up-{i}")
+        for i in range(max(1, DEFAULT_MAX_UP))
+    ]
+
+    await r.hset(WORKER_HEARTBEAT, WORKER_ID, str(time.time()))
+    await r.hset(WORKER_STATUS, WORKER_ID, json.dumps(stats.snapshot(dl_sem.limit, up_sem.limit)))
+    log.info(
+        "Worker %s chạy %s download loop / %s upload loop", WORKER_ID, DEFAULT_MAX_DL, DEFAULT_MAX_UP
     )
 
-    await app.start()
-    log.info("App started, creating tasks")
-
-    # heartbeat / command
-    hb = asyncio.create_task(heartbeat_loop(r))
-    cmd = asyncio.create_task(command_listener(r, dl_sem, up_sem, stop_event))
-
-    # upload queue within this worker process
-    up_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=0)
-
-    # start download/upload consumers
-    async def download_loop():
-        async for db in _db_session_iter():
-            await download_worker(app, r, db, dl_sem, up_queue, stop_event)
-            break
-
-    async def upload_loop():
-        async for db in _db_session_iter():
-            await upload_worker(app, r, db, up_sem, up_queue, stop_event)
-            break
-
-    download_loops = max(1, dl_sem.limit)
-    upload_loops = max(1, up_sem.limit)
-
-    downloads = [asyncio.create_task(download_loop()) for _ in range(download_loops)]
-    uploads = [asyncio.create_task(upload_loop()) for _ in range(upload_loops)]
-    log.info(f"Started {len(downloads)} download loops, {len(uploads)} upload loops")
-
-    # new job consumer
-    new_jobs = asyncio.create_task(new_job_consumer(app, r, dl_sem, stop_event))
-
-    # init status
-    await r.hset(WORKER_STATUS, WORKER_ID, json.dumps({"session": "ready", "max_dl": dl_sem.limit, "max_up": up_sem.limit}))
-
-    await stop_event.wait()
-
-    # shutdown
-    for t in downloads + uploads:
-        t.cancel()
-    new_jobs.cancel()
-    cmd.cancel()
-    hb.cancel()
-
-    await app.stop()
+    try:
+        await stop_event.wait()
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await r.hdel(WORKER_HEARTBEAT, WORKER_ID)
+            await r.hdel(WORKER_STATUS, WORKER_ID)
+        except Exception:
+            pass
+        try:
+            await app.stop()
+        except Exception:
+            pass
+        try:
+            await r.aclose()
+        except Exception:
+            pass
+        log.info("Worker %s đã dừng", WORKER_ID)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

@@ -1,23 +1,33 @@
 """api/routes/jobs.py"""
 import json
+import time
 from typing import List, Optional
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
-from ..models import Job, Task, Transferred
+from ..models import Job, Task
 from ..redis_client import get_redis
-from ..task_utils import can_retry_task_status, normalize_status
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../'))
+from ..task_utils import can_retry_task_status
 from shared.constants import (
-    JOB_STATUS_CANCELLED, TASK_STATUS_CANCELLED,
-    TASK_STATUS_PENDING, QUEUE_DOWNLOAD,
+    JOB_STATUS_CANCELLED,
+    JOB_STATUS_RUNNING,
+    QUEUE_DOWNLOAD,
+    QUEUE_NEW_JOB,
+    QUEUE_UPLOAD,
+    TASK_STATUS_CANCELLED,
+    TASK_STATUS_FAILED,
+    TASK_STATUS_PENDING,
+    WORKER_HEARTBEAT,
 )
+from shared.peers import normalize_peer
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+HEARTBEAT_TIMEOUT = 30
 
 
 class JobCreate(BaseModel):
@@ -42,31 +52,7 @@ class JobOut(BaseModel):
         from_attributes = True
 
 
-@router.get("", response_model=List[JobOut])
-async def list_jobs(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Job).order_by(Job.created_at.desc()).limit(100))
-    jobs = result.scalars().all()
-    return [
-        {
-            "id": job.id,
-            "src_link": job.src_link,
-            "dst_link": job.dst_link,
-            "src_title": job.src_title,
-            "dst_title": job.dst_title,
-            "status": job.status,
-            "total": job.total or 0,
-            "done": job.done or 0,
-            "failed": job.failed or 0,
-        }
-        for job in jobs
-    ]
-
-
-@router.get("/{job_id}", response_model=JobOut)
-async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
-    job = await db.get(Job, job_id)
-    if not job:
-        raise HTTPException(404, "Job không tồn tại")
+def _job_dict(job: Job) -> dict:
     return {
         "id": job.id,
         "src_link": job.src_link,
@@ -80,13 +66,57 @@ async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
+async def _online_workers(redis) -> int:
+    heartbeats = await redis.hgetall(WORKER_HEARTBEAT)
+    now = time.time()
+    online = 0
+    for ts in heartbeats.values():
+        try:
+            if now - float(ts) < HEARTBEAT_TIMEOUT:
+                online += 1
+        except (TypeError, ValueError):
+            continue
+    return online
+
+
+@router.get("", response_model=List[JobOut])
+async def list_jobs(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Job).order_by(Job.created_at.desc()).limit(100))
+    return [_job_dict(job) for job in result.scalars().all()]
+
+
+@router.get("/{job_id}", response_model=JobOut)
+async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, "Job không tồn tại")
+    return _job_dict(job)
+
+
 @router.post("", response_model=JobOut, status_code=201)
 async def create_job(
     body: JobCreate,
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
-    job = Job(src_link=body.src_link, dst_link=body.dst_link, status="running")
+    # Validate sớm: link sai định dạng sẽ làm worker fail từng task một cách khó hiểu
+    try:
+        normalize_peer(body.src_link)
+        normalize_peer(body.dst_link)
+    except ValueError as exc:
+        raise HTTPException(400, f"Link chat không hợp lệ: {exc}")
+
+    if body.from_msg_id is not None and body.to_msg_id is None:
+        raise HTTPException(400, "Cần nhập cả from_msg_id và to_msg_id, hoặc bỏ trống cả hai")
+    if body.to_msg_id is not None and body.from_msg_id is None:
+        raise HTTPException(400, "Cần nhập cả from_msg_id và to_msg_id, hoặc bỏ trống cả hai")
+
+    if await _online_workers(redis) == 0:
+        raise HTTPException(
+            503, "Chưa có worker nào online — hãy khởi động worker trước khi tạo job"
+        )
+
+    job = Job(src_link=body.src_link, dst_link=body.dst_link, status=JOB_STATUS_RUNNING)
     db.add(job)
     await db.commit()
     await db.refresh(job)
@@ -99,15 +129,21 @@ async def create_job(
         "from_msg_id": body.from_msg_id,
         "to_msg_id": body.to_msg_id,
     }
-    await redis.lpush("queue:new_job", json.dumps(payload))
-    return job
+    await redis.lpush(QUEUE_NEW_JOB, json.dumps(payload))
+    return _job_dict(job)
 
 
 @router.delete("/{job_id}/cancel")
-async def cancel_job(job_id: int, db: AsyncSession = Depends(get_db)):
+async def cancel_job(job_id: int, db: AsyncSession = Depends(get_db), redis=Depends(get_redis)):
     job = await db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job không tồn tại")
+
+    result = await db.execute(
+        select(Task.id).where(Task.job_id == job_id, Task.status == TASK_STATUS_PENDING)
+    )
+    pending_ids = [str(row[0]) for row in result.all()]
+
     job.status = JOB_STATUS_CANCELLED
     await db.execute(
         update(Task)
@@ -115,11 +151,22 @@ async def cancel_job(job_id: int, db: AsyncSession = Depends(get_db)):
         .values(status=TASK_STATUS_CANCELLED)
     )
     await db.commit()
-    return {"ok": True}
+
+    # Gỡ luôn khỏi hàng đợi Redis, nếu không worker vẫn pop ra rồi mới bỏ
+    if pending_ids:
+        await redis.zrem(QUEUE_DOWNLOAD, *pending_ids)
+        await redis.zrem(QUEUE_UPLOAD, *pending_ids)
+
+    return {"ok": True, "cancelled": len(pending_ids)}
 
 
 @router.post("/{job_id}/tasks/{task_id}/retry")
-async def retry_task(job_id: int, task_id: int, db: AsyncSession = Depends(get_db), redis=Depends(get_redis)):
+async def retry_task(
+    job_id: int,
+    task_id: int,
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+):
     task = await db.get(Task, task_id)
     if not task or task.job_id != job_id:
         raise HTTPException(404, "Task không tồn tại")
@@ -129,11 +176,44 @@ async def retry_task(job_id: int, task_id: int, db: AsyncSession = Depends(get_d
     task.status = TASK_STATUS_PENDING
     task.error = None
     task.worker_id = None
-    task.updated_at = None
+    task.attempt = 0
     await db.commit()
 
     await redis.zadd(QUEUE_DOWNLOAD, {str(task.id): 0})
     return {"ok": True, "task_id": task_id}
+
+
+@router.post("/{job_id}/retry_failed")
+async def retry_failed_tasks(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+):
+    """Đẩy lại toàn bộ task failed/cancelled của job vào hàng đợi."""
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, "Job không tồn tại")
+
+    result = await db.execute(
+        select(Task.id).where(
+            Task.job_id == job_id,
+            Task.status.in_([TASK_STATUS_FAILED, TASK_STATUS_CANCELLED]),
+        )
+    )
+    task_ids = [row[0] for row in result.all()]
+    if not task_ids:
+        return {"ok": True, "requeued": 0}
+
+    await db.execute(
+        update(Task)
+        .where(Task.id.in_(task_ids))
+        .values(status=TASK_STATUS_PENDING, error=None, worker_id=None, attempt=0)
+    )
+    job.status = JOB_STATUS_RUNNING
+    await db.commit()
+
+    await redis.zadd(QUEUE_DOWNLOAD, {str(tid): 0 for tid in task_ids})
+    return {"ok": True, "requeued": len(task_ids)}
 
 
 @router.get("/{job_id}/tasks")
@@ -143,9 +223,10 @@ async def job_tasks(
     limit: int = 200,
     db: AsyncSession = Depends(get_db),
 ):
-    q = select(Task).where(Task.job_id == job_id).order_by(Task.id.desc()).limit(limit)
+    q = select(Task).where(Task.job_id == job_id)
     if status:
-        q = q.where(Task.status == status)
+        q = q.where(Task.status == status.lower())
+    q = q.order_by(Task.id.desc()).limit(limit)
     result = await db.execute(q)
     tasks = result.scalars().all()
     return [

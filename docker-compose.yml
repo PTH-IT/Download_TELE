@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   redis:
     image: redis:7-alpine
@@ -8,6 +6,11 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   postgres:
     image: postgres:16-alpine
@@ -20,63 +23,76 @@ services:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tgcopy -d tgcopy"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   api:
     build:
       context: .
       dockerfile: api/Dockerfile
-
     restart: unless-stopped
     ports:
-      - "8001:8000"
+      # Frontend mặc định gọi http://<host>:8000 — đổi API_PORT thì đổi cả web/config.js
+      - "${API_PORT:-8000}:8000"
     environment:
       - DATABASE_URL=postgresql+asyncpg://tgcopy:tgcopy_secret@postgres:5432/tgcopy
       - REDIS_URL=redis://redis:6379
+      - SESSION_DIR=/app/sessions
     volumes:
       - ./sessions:/app/sessions
       - ./downloads:/app/downloads
     depends_on:
-      - redis
-      - postgres
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
 
   worker:
     build:
       context: .
       dockerfile: worker/Dockerfile
-
-    restart: "no"
+    restart: unless-stopped
     environment:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql+asyncpg://tgcopy:tgcopy_secret@postgres:5432/tgcopy
       - SESSION_DIR=/app/sessions
       - DOWNLOAD_DIR=/app/downloads
-      - WORKER_ID=worker-1
-
+      - MAX_DL=${MAX_DL:-2}
+      - MAX_UP=${MAX_UP:-4}
+      # KHÔNG set WORKER_ID ở đây: mọi replica sẽ trùng id, ghi đè heartbeat
+      # của nhau và dashboard chỉ thấy đúng 1 worker. Để trống thì worker tự
+      # lấy hostname (= container id) làm id duy nhất.
+      # - API_ID / API_HASH: dùng app Telegram riêng của bạn
+      # - SESSION_STRING: gán session riêng cho từng worker nếu chạy nhiều tài khoản
     volumes:
       - ./sessions:/app/sessions
       - ./downloads:/app/downloads
     depends_on:
-      - redis
-      - postgres
-      - api
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # Số worker: sửa replicas hoặc chạy
+    #   docker compose up -d --scale worker=5
     deploy:
-      replicas: 1   # tăng lên để thêm worker: docker-compose up --scale worker=5
-
+      replicas: ${WORKER_REPLICAS:-1}
 
   web:
     build:
       context: ./web
       dockerfile: Dockerfile
-
     restart: unless-stopped
     ports:
-      - "3000:3000"
-    volumes:
-      - ./sessions:/app/sessions
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      # server.py mặc định 8001 — không set biến này thì cổng publish 3000 trỏ
+      # vào container không có ai lắng nghe.
+      - PORT=3000
     depends_on:
       - api
-
-
 
 volumes:
   redis_data:
