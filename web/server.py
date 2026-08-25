@@ -59,11 +59,27 @@ def render_config() -> bytes:
 class Handler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    # Đặt sẵn để end_headers() không cần kiểm tra hasattr
+    _cache_header_sent = False
+
     def log_message(self, format, *args):
         return
 
+    def end_headers(self):
+        # SimpleHTTPRequestHandler chỉ gửi Last-Modified. Không có Cache-Control,
+        # trình duyệt tự suy ra thời hạn và dùng lại html/js cũ mà không hỏi lại
+        # server — sửa frontend xong vẫn chạy bản cũ. no-cache vẫn cho phép trả
+        # 304 nên không chậm đi, chỉ bắt buộc phải kiểm tra lại.
+        if not self._cache_header_sent:
+            path = self.path.split("?")[0]
+            if path in ("", "/") or path.endswith((".html", ".js", ".css")):
+                self.send_header("Cache-Control", "no-cache, must-revalidate")
+                self._cache_header_sent = True
+        super().end_headers()
+
     # ---------------- static ----------------
     def do_GET(self):
+        self._cache_header_sent = False
         path = self.path.split("?")[0]
 
         if path.startswith("/ws/"):
@@ -78,8 +94,20 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_HEAD(self):
-        if self.path.split("?")[0].startswith(PROXY_PREFIXES):
+        self._cache_header_sent = False
+        path = self.path.split("?")[0]
+        if path.startswith(PROXY_PREFIXES):
             return self._proxy_http("HEAD")
+        if path == "/config.js":
+            # phải khớp với bản GET sinh động, không rơi về file tĩnh
+            payload = render_config()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self._cache_header_sent = True
+            self.end_headers()
+            return
         return super().do_HEAD()
 
     def do_POST(self):
@@ -99,6 +127,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        self._cache_header_sent = True
         self.end_headers()
         self.wfile.write(payload)
 
