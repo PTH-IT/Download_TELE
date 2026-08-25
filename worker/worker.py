@@ -109,7 +109,11 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/app/downloads")
 DELETE_AFTER_UPLOAD = os.getenv("DELETE_AFTER_UPLOAD", "1") not in ("0", "false", "False")
 
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
-LOCK_TTL = int(os.getenv("TASK_LOCK_TTL", "3600"))
+# TTL ngắn + gia hạn định kỳ trong lúc chạy. Nếu để TTL dài (kiểu 1 giờ) thì
+# worker chết giữa chừng vẫn "giữ" task đến hết TTL, janitor không dám nhận lại
+# và task treo ở trạng thái downloading suốt thời gian đó.
+LOCK_TTL = int(os.getenv("TASK_LOCK_TTL", "300"))
+LOCK_REFRESH_INTERVAL = max(10, LOCK_TTL // 3)
 SCAN_CAP = int(os.getenv("SCAN_CAP", "200"))
 PROGRESS_INTERVAL = float(os.getenv("PROGRESS_INTERVAL", "1.0"))
 CAPTION_LIMIT = 1024
@@ -247,6 +251,16 @@ async def release_lock(r: aioredis.Redis, lock_key: str):
         await r.delete(lock_key)
     except Exception:
         pass
+
+
+async def _keep_lock_alive(r: aioredis.Redis, lock_key: str):
+    """Gia hạn lock trong lúc task còn chạy (tải file lớn có thể lâu hơn TTL)."""
+    while True:
+        await asyncio.sleep(LOCK_REFRESH_INTERVAL)
+        try:
+            await r.expire(lock_key, LOCK_TTL)
+        except Exception as exc:
+            log.debug("Gia hạn lock %s lỗi: %s", lock_key, exc)
 
 
 async def heartbeat_loop(
@@ -556,17 +570,18 @@ async def download_worker(
             await asyncio.sleep(0.5)
             continue
 
+        keeper = asyncio.create_task(_keep_lock_alive(r, lock_key))
         try:
             # Session mới cho mỗi task: tránh identity-map trả về dữ liệu cũ và
             # tránh transaction hỏng lây sang task kế tiếp.
             async with AsyncSessionLocal() as db:
                 await _handle_download(app, r, db, dl_sem, stats, task_id)
         except asyncio.CancelledError:
-            await release_lock(r, lock_key)
             raise
         except Exception as exc:
             log.exception("download_worker lỗi ngoài dự kiến ở task %s: %s", task_id, exc)
         finally:
+            keeper.cancel()
             await release_lock(r, lock_key)
 
 
@@ -734,15 +749,18 @@ async def upload_worker(
             await asyncio.sleep(0.5)
             continue
 
+        keeper = asyncio.create_task(_keep_lock_alive(r, lock_key))
         try:
+            # Session mới cho mỗi task: tránh identity-map trả về dữ liệu cũ và
+            # tránh transaction hỏng lây sang task kế tiếp.
             async with AsyncSessionLocal() as db:
                 await _handle_upload(app, r, db, up_sem, stats, task_id)
         except asyncio.CancelledError:
-            await release_lock(r, lock_key)
             raise
         except Exception as exc:
             log.exception("upload_worker lỗi ngoài dự kiến ở task %s: %s", task_id, exc)
         finally:
+            keeper.cancel()
             await release_lock(r, lock_key)
 
 
