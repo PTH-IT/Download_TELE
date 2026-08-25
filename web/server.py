@@ -48,6 +48,29 @@ CONFIG_TEMPLATE = """// File này được web/server.py sinh ra lúc chạy —
   try { saved = localStorage.getItem("API_BASE"); } catch (e) {}
 
   window.API_BASE = saved || API_BASE || "";
+
+  // Điều hướng kèm tham số chống cache: bản html cũ trong cache trình duyệt
+  // vẫn trỏ cấu hình cũ, đổi URL là buộc tải lại bản mới.
+  window.goTo = function (path) {
+    var sep = path.indexOf("?") === -1 ? "?" : "&";
+    window.location.href = path + sep + "b=" + Date.now();
+  };
+
+  // Báo lỗi thay vì âm thầm đá về trang login khi API không gọi được.
+  window.showFatalError = function (message) {
+    var id = "fatal-error-banner";
+    var el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement("div");
+      el.id = id;
+      el.style.cssText =
+        "position:fixed;top:0;left:0;right:0;z-index:99999;padding:12px 16px;" +
+        "background:#7f1d1d;color:#fff;font:14px/1.5 system-ui,sans-serif;" +
+        "box-shadow:0 2px 8px rgba(0,0,0,.4)";
+      document.body.appendChild(el);
+    }
+    el.textContent = message;
+  };
 })();
 """
 

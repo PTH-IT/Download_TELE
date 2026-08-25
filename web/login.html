@@ -204,7 +204,9 @@
             const state = await stateRes.json();
             
             if (state.authenticated) {
-              window.location.href = "/index.html";
+              // kèm tham số chống cache: bản index.html cũ trong cache trình
+              // duyệt vẫn trỏ cấu hình cũ và sẽ đá ngược lại trang login
+              (window.goTo || ((p) => (window.location.href = p)))("/index.html");
               return;
             }
             if (state.error) {

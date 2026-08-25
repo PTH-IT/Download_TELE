@@ -40,6 +40,7 @@ from shared.constants import (
     TASK_STATUS_FAILED,
     TASK_STATUS_CANCELLED,
     JOB_STATUS_CANCELLED,
+    JOB_STATUS_RUNNING,
 )
 from shared.job_state import refresh_job_counters, update_task_status
 from shared.peers import normalize_peer
@@ -195,6 +196,31 @@ class WorkerStats:
 # --------------------------------------------------------------------------
 # Redis helpers
 # --------------------------------------------------------------------------
+_PEER_CACHE: dict[str, Union[int, str]] = {}
+
+
+async def resolve_chat(app: Client, raw) -> Union[int, str]:
+    """Đổi link/username/id thành chat id mà send_* dùng được.
+
+    Link mời (t.me/+hash) chỉ có get_chat hiểu được, send_video thì không.
+    Gọi get_chat còn có tác dụng nạp peer vào session của chính worker này —
+    worker khác chưa từng thấy chat sẽ báo PEER_ID_INVALID nếu bỏ qua bước đó.
+    """
+    key = str(raw)
+    if key in _PEER_CACHE:
+        return _PEER_CACHE[key]
+
+    peer = normalize_peer(raw)
+    try:
+        chat = await app.get_chat(peer)
+        resolved = chat.id
+    except Exception as exc:
+        log.warning("Không resolve được chat %r qua get_chat: %s", raw, exc)
+        resolved = peer
+    _PEER_CACHE[key] = resolved
+    return resolved
+
+
 async def enqueue_progress(r: aioredis.Redis, payload: dict):
     try:
         await r.publish(PUBSUB_PROGRESS, json.dumps(payload, ensure_ascii=False))
@@ -396,7 +422,7 @@ async def _handle_download(
     try:
         # job.src_link là chuỗi ("-1001234..." hoặc link t.me). Truyền thẳng cho
         # Pyrogram sẽ bị hiểu là username -> PEER_ID_INVALID.
-        src_peer = normalize_peer(job.src_link)
+        src_peer = await resolve_chat(app, job.src_link)
         msg = await app.get_messages(src_peer, task.msg_id)
         if not msg or getattr(msg, "empty", False):
             raise RuntimeError(f"Không lấy được message {task.msg_id} từ {job.src_link}")
@@ -443,6 +469,17 @@ async def _handle_download(
             caption=(msg.caption or task.caption or "")[:CAPTION_LIMIT],
         )
         await db.commit()
+
+        # Job có thể bị huỷ trong lúc đang tải — bỏ file thay vì upload thừa
+        if not await _job_is_active(db, job.id):
+            await update_task_status(db, task_id, TASK_STATUS_CANCELLED)
+            await db.commit()
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            log.info("Job %s đã huỷ, bỏ task %s sau khi tải", job.id, task_id)
+            return
 
         # Đẩy sang hàng đợi upload dùng chung -> worker nào rảnh cũng upload được
         await r.zadd(QUEUE_UPLOAD, {str(task_id): time.time()})
@@ -607,7 +644,7 @@ async def _handle_upload(
     stats.current_task = task_id
 
     try:
-        dst_peer = normalize_peer(job.dst_link)
+        dst_peer = await resolve_chat(app, job.dst_link)
         caption = (task.caption or "")[:CAPTION_LIMIT]
         kind = task.media_kind or guess_kind_from_path(path)
 
@@ -733,6 +770,12 @@ async def _iter_messages(app: Client, peer, start: int, end: int):
             yield msg
 
 
+async def _job_is_active(db: AsyncSession, job_id: int) -> bool:
+    res = await db.execute(select(Job.status).where(Job.id == job_id))
+    status = res.scalar_one_or_none()
+    return status == JOB_STATUS_RUNNING
+
+
 async def _create_task_row(db: AsyncSession, r: aioredis.Redis, job_id: int, msg) -> bool:
     existing = await db.execute(
         select(Task.id).where(Task.job_id == job_id, Task.msg_id == msg.id).limit(1)
@@ -828,6 +871,14 @@ async def _process_new_job(app: Client, r: aioredis.Redis, job_req: dict, stop_e
                     continue
                 if await _create_task_row(db, r, job_id, msg):
                     created += 1
+                    # Quét dải msg_id rộng có thể mất rất lâu; cập nhật counter
+                    # dọc đường để dashboard không đứng ở total = 0.
+                    if created % 50 == 0:
+                        await refresh_job_counters(db, job_id)
+                        await db.commit()
+                        if not await _job_is_active(db, job_id):
+                            log.info("Job %s đã bị huỷ, dừng quét", job_id)
+                            break
         else:
             scanned = 0
             async for msg in app.get_chat_history(src_peer, limit=SCAN_CAP):
@@ -840,6 +891,12 @@ async def _process_new_job(app: Client, r: aioredis.Redis, job_req: dict, stop_e
                     continue
                 if await _create_task_row(db, r, job_id, msg):
                     created += 1
+                    if created % 50 == 0:
+                        await refresh_job_counters(db, job_id)
+                        await db.commit()
+                        if not await _job_is_active(db, job_id):
+                            log.info("Job %s đã bị huỷ, dừng quét", job_id)
+                            break
 
         await refresh_job_counters(db, job_id)
         await db.commit()

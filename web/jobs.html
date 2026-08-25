@@ -254,18 +254,32 @@
       const API_BASE = (window.API_BASE || "").replace(/\/$/, "");
 
       async function checkAuth() {
+        // Chỉ đá về login khi API nói rõ là chưa đăng nhập. Lỗi mạng / gọi
+        // nhầm cổng trước đây cũng bị coi là "chưa đăng nhập" nên vừa login
+        // xong đã bị đá ra, mà không hiện lý do.
+        let res;
         try {
-          const res = await fetch(`${API_BASE}/api/auth/state`, { method: "GET" });
-          const state = await res.json();
-          if (!state.authenticated) {
-            window.location.href = "/login.html";
-            return false;
-          }
-          return true;
+          res = await fetch(`${API_BASE}/api/auth/state`, { method: "GET" });
         } catch (e) {
-          window.location.href = "/login.html";
+          window.showFatalError?.(`Không gọi được API (${API_BASE || location.origin}): ${e.message}`);
           return false;
         }
+        if (!res.ok) {
+          window.showFatalError?.(`API trả ${res.status} cho /api/auth/state — kiểm tra lại cấu hình API_BASE.`);
+          return false;
+        }
+        let state;
+        try {
+          state = await res.json();
+        } catch (e) {
+          window.showFatalError?.("API trả về dữ liệu không hợp lệ cho /api/auth/state.");
+          return false;
+        }
+        if (!state.authenticated) {
+          (window.goTo || ((p) => (window.location.href = p)))("/login.html");
+          return false;
+        }
+        return true;
       }
 
       function statusBadge(status) {
