@@ -22,6 +22,7 @@ from shared.constants import (
     TASK_STATUS_FAILED,
     TASK_STATUS_PENDING,
     WORKER_HEARTBEAT,
+    WORKER_STATUS,
 )
 from shared.peers import normalize_peer
 
@@ -66,17 +67,25 @@ def _job_dict(job: Job) -> dict:
     }
 
 
-async def _online_workers(redis) -> int:
+async def _ready_workers(redis) -> int:
+    """Worker còn heartbeat VÀ đã đăng nhập Telegram xong."""
     heartbeats = await redis.hgetall(WORKER_HEARTBEAT)
+    statuses = await redis.hgetall(WORKER_STATUS)
     now = time.time()
-    online = 0
-    for ts in heartbeats.values():
+    ready = 0
+    for worker_id, ts in heartbeats.items():
         try:
-            if now - float(ts) < HEARTBEAT_TIMEOUT:
-                online += 1
+            if now - float(ts) >= HEARTBEAT_TIMEOUT:
+                continue
         except (TypeError, ValueError):
             continue
-    return online
+        try:
+            state = json.loads(statuses.get(worker_id) or "{}")
+        except ValueError:
+            state = {}
+        if state.get("session") == "ready":
+            ready += 1
+    return ready
 
 
 @router.get("", response_model=List[JobOut])
@@ -111,9 +120,10 @@ async def create_job(
     if body.to_msg_id is not None and body.from_msg_id is None:
         raise HTTPException(400, "Cần nhập cả from_msg_id và to_msg_id, hoặc bỏ trống cả hai")
 
-    if await _online_workers(redis) == 0:
+    if await _ready_workers(redis) == 0:
         raise HTTPException(
-            503, "Chưa có worker nào online — hãy khởi động worker trước khi tạo job"
+            503,
+            "Chưa có worker nào sẵn sàng — kiểm tra worker đã chạy và đã đăng nhập Telegram chưa",
         )
 
     job = Job(src_link=body.src_link, dst_link=body.dst_link, status=JOB_STATUS_RUNNING)

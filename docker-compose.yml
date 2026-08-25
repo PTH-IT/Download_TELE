@@ -3,7 +3,8 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      # đổi REDIS_PORT nếu máy đã có redis chạy sẵn
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -20,7 +21,8 @@ services:
       POSTGRES_USER: tgcopy
       POSTGRES_PASSWORD: tgcopy_secret
     ports:
-      - "5432:5432"
+      # đổi PG_PORT nếu máy đã có postgres chạy sẵn
+      - "${PG_PORT:-5432}:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -62,6 +64,7 @@ services:
       - DOWNLOAD_DIR=/app/downloads
       - MAX_DL=${MAX_DL:-2}
       - MAX_UP=${MAX_UP:-4}
+      - WORKER_STALE_AFTER=${WORKER_STALE_AFTER:-600}
       # KHÔNG set WORKER_ID ở đây: mọi replica sẽ trùng id, ghi đè heartbeat
       # của nhau và dashboard chỉ thấy đúng 1 worker. Để trống thì worker tự
       # lấy hostname (= container id) làm id duy nhất.

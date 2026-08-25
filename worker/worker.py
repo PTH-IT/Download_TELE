@@ -100,6 +100,14 @@ CAPTION_LIMIT = 1024
 
 JANITOR_LOCK = "lock:janitor"
 AUTH_ERROR_KEY = "auth:last_error"
+# Yêu cầu OTP cũ hơn ngần này bị bỏ qua — nếu không, worker khởi động lại sẽ
+# phát lại yêu cầu tồn trong Redis và gửi OTP ngoài ý muốn.
+AUTH_REQUEST_MAX_AGE = int(os.getenv("AUTH_REQUEST_MAX_AGE", "120"))
+# TTL ngắn + gia hạn liên tục: auth master chết thì worker khác tiếp quản sau
+# tối đa 60 giây thay vì kẹt 5 phút.
+AUTH_LOCK_TTL = int(os.getenv("AUTH_LOCK_TTL", "60"))
+# Heartbeat cũ hơn ngần này bị xoá khỏi dashboard
+WORKER_STALE_AFTER = int(os.getenv("WORKER_STALE_AFTER", "600"))
 
 
 class AdaptiveSemaphore:
@@ -144,6 +152,7 @@ class WorkerStats:
     """Số liệu hiển thị trên dashboard."""
 
     def __init__(self):
+        self.session_state = "waiting_auth"
         self.dl_speed = 0.0
         self.up_speed = 0.0
         self.total_done = 0
@@ -154,7 +163,7 @@ class WorkerStats:
 
     def snapshot(self, dl_limit: int, up_limit: int) -> dict:
         return {
-            "session": "ready",
+            "session": self.session_state,
             "current_task": self.current_task,
             "dl_speed_mbs": round(self.dl_speed / (1 << 20), 2),
             "up_speed_mbs": round(self.up_speed / (1 << 20), 2),
@@ -179,6 +188,16 @@ async def enqueue_progress(r: aioredis.Redis, payload: dict):
 
 async def try_acquire_lock(r: aioredis.Redis, lock_key: str, ttl_sec: int = LOCK_TTL) -> bool:
     return bool(await r.set(lock_key, WORKER_ID, nx=True, ex=ttl_sec))
+
+
+def _is_stale_request(payload: dict) -> bool:
+    ts = payload.get("timestamp")
+    if not ts:
+        return False
+    try:
+        return (time.time() - float(ts)) > AUTH_REQUEST_MAX_AGE
+    except (TypeError, ValueError):
+        return False
 
 
 async def release_lock(r: aioredis.Redis, lock_key: str):
@@ -876,12 +895,30 @@ async def _requeue_orphans(r: aioredis.Redis):
             log.info("Janitor đưa lại %s task bị kẹt vào hàng đợi", recovered)
 
 
+async def _prune_dead_workers(r: aioredis.Redis):
+    """Xoá heartbeat của worker đã tắt từ lâu, tránh dashboard đầy worker ma."""
+    heartbeats = await r.hgetall(WORKER_HEARTBEAT)
+    now = time.time()
+    dead = []
+    for worker_id, ts in heartbeats.items():
+        try:
+            if now - float(ts) > WORKER_STALE_AFTER:
+                dead.append(worker_id)
+        except (TypeError, ValueError):
+            dead.append(worker_id)
+    if dead:
+        await r.hdel(WORKER_HEARTBEAT, *dead)
+        await r.hdel(WORKER_STATUS, *dead)
+        log.info("Janitor xoá %s worker đã chết: %s", len(dead), ", ".join(dead))
+
+
 async def janitor_loop(r: aioredis.Redis, stop_event: asyncio.Event):
     while not stop_event.is_set():
         try:
             # chỉ 1 worker chạy janitor mỗi phút
             if await try_acquire_lock(r, JANITOR_LOCK, ttl_sec=55):
                 await _requeue_orphans(r)
+                await _prune_dead_workers(r)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -922,10 +959,15 @@ async def _load_session(r: aioredis.Redis) -> Optional[str]:
 
 
 async def wait_for_session(r: aioredis.Redis, stop_event: asyncio.Event) -> Optional[str]:
+    """Chờ session; nếu auth master biến mất thì tự đứng ra làm master."""
     while not stop_event.is_set():
         session = await _load_session(r)
         if session:
             return session
+        if await try_acquire_lock(r, AUTH_LOCK_KEY, ttl_sec=AUTH_LOCK_TTL):
+            session = await run_auth_master(r, stop_event)
+            if session:
+                return session
         await asyncio.sleep(1)
     return None
 
@@ -939,7 +981,7 @@ async def run_auth_master(r: aioredis.Redis, stop_event: asyncio.Event) -> Optio
     try:
         while not stop_event.is_set() and not session_str:
             # gia hạn lock, tránh worker khác cũng nhảy vào làm master
-            await r.expire(AUTH_LOCK_KEY, 300)
+            await r.expire(AUTH_LOCK_KEY, AUTH_LOCK_TTL)
 
             req_payload = await r.brpop(AUTH_OTP_REQ_QUEUE, timeout=2)
             if req_payload:
@@ -947,7 +989,11 @@ async def run_auth_master(r: aioredis.Redis, stop_event: asyncio.Event) -> Optio
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8")
                 try:
-                    phone = json.loads(raw).get("phone_number", "")
+                    req = json.loads(raw)
+                    phone = req.get("phone_number", "")
+                    if _is_stale_request(req):
+                        log.info("Bỏ qua yêu cầu OTP cũ cho %s", phone)
+                        phone = ""
                     if phone:
                         sent = await app.send_code(phone)
                         await r.set(f"auth:phone_code_hash:{phone}", sent.phone_code_hash, ex=300)
@@ -970,6 +1016,9 @@ async def run_auth_master(r: aioredis.Redis, stop_event: asyncio.Event) -> Optio
                 otp = data.get("otp", "")
                 password = data.get("password") or ""
                 if not (phone and otp):
+                    continue
+                if _is_stale_request(data):
+                    log.info("Bỏ qua OTP cũ cho %s", phone)
                     continue
 
                 phone_code_hash = await r.get(f"auth:phone_code_hash:{phone}")
@@ -1024,21 +1073,26 @@ async def main():
 
     log.info("Khởi động worker %s", WORKER_ID)
 
-    session_str = await _load_session(r)
-    if not session_str and await try_acquire_lock(r, AUTH_LOCK_KEY, ttl_sec=300):
-        session_str = await run_auth_master(r, stop_event)
-    if not session_str:
-        log.info("Worker %s chờ session từ auth master", WORKER_ID)
-        session_str = await wait_for_session(r, stop_event)
-    if not session_str or stop_event.is_set():
-        return
-
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    await init_db()
-
     dl_sem = AdaptiveSemaphore(DEFAULT_MAX_DL)
     up_sem = AdaptiveSemaphore(DEFAULT_MAX_UP)
     stats = WorkerStats()
+
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    # DB và các vòng lặp không phụ thuộc Telegram được bật trước khi đăng nhập:
+    # worker chưa auth vẫn hiện trên dashboard (session = "waiting_auth") và vẫn
+    # dọn được task mồ côi / heartbeat của worker đã chết.
+    await init_db()
+    hb_task = asyncio.create_task(heartbeat_loop(r, stats, dl_sem, up_sem), name="heartbeat")
+    janitor_task = asyncio.create_task(janitor_loop(r, stop_event), name="janitor")
+
+    session_str = await _load_session(r)
+    if not session_str:
+        log.info("Worker %s chờ đăng nhập Telegram", WORKER_ID)
+        session_str = await wait_for_session(r, stop_event)
+    if not session_str or stop_event.is_set():
+        hb_task.cancel()
+        janitor_task.cancel()
+        return
 
     # Tên client phải khác nhau giữa các worker để không đụng file session
     app = Client(
@@ -1053,11 +1107,13 @@ async def main():
     me = await app.get_me()
     log.info("Đăng nhập Telegram: %s (id=%s)", me.username or me.first_name, me.id)
 
+    stats.session_state = "ready"
+
     tasks = [
-        asyncio.create_task(heartbeat_loop(r, stats, dl_sem, up_sem), name="heartbeat"),
+        hb_task,
+        janitor_task,
         asyncio.create_task(command_listener(r, dl_sem, up_sem, stop_event), name="cmd"),
         asyncio.create_task(new_job_consumer(app, r, stop_event), name="new_jobs"),
-        asyncio.create_task(janitor_loop(r, stop_event), name="janitor"),
     ]
     tasks += [
         asyncio.create_task(download_worker(app, r, dl_sem, stop_event, stats), name=f"dl-{i}")

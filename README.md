@@ -19,6 +19,11 @@ docker compose up -d --build
 - Dashboard: http://localhost:3000
 - API: http://localhost:8000 (đổi bằng biến `API_PORT`)
 
+Nếu máy đã có postgres/redis/dịch vụ khác chiếm cổng, đặt `PG_PORT`,
+`REDIS_PORT`, `API_PORT`, `WEB_PORT` trong `.env`. Frontend tự suy ra host hiện
+tại; nếu đổi `API_PORT` thì sửa `API_PORT` trong `web/config.js` hoặc mở
+dashboard với `?api=http://localhost:<cổng>`.
+
 Lần đầu vào dashboard sẽ bị chuyển sang `/login.html` để đăng nhập Telegram bằng
 số điện thoại + OTP. Worker giữ khoá `lock:auth_session` là bên gửi OTP và tạo
 session; session được lưu ở `sessions/session_string.txt` và trong Redis nên các
@@ -43,6 +48,7 @@ key).
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
 | `API_PORT` / `WEB_PORT` | `8000` / `3000` | cổng publish của api và web |
+| `PG_PORT` / `REDIS_PORT` | `5432` / `6379` | cổng publish của postgres/redis (đổi khi trùng) |
 | `WORKER_REPLICAS` | `1` | số worker khi `docker compose up` |
 | `MAX_DL` / `MAX_UP` | `2` / `4` | số download/upload song song mỗi worker |
 | `SESSION_STRING` | — | session Telegram riêng cho worker đó |
@@ -50,6 +56,14 @@ key).
 | `SCAN_CAP` | `200` | số message quét khi job không chỉ định khoảng msg_id |
 | `DELETE_AFTER_UPLOAD` | `1` | xoá file sau khi upload xong |
 | `LOG_LEVEL` | `INFO` | mức log của worker |
+| `AUTH_LOCK_TTL` | `60` | thời gian giữ quyền auth master trước khi worker khác tiếp quản |
+| `WORKER_STALE_AFTER` | `600` | heartbeat cũ hơn ngần này bị xoá khỏi dashboard |
+
+Sao chép `.env.example` thành `.env` để đổi các giá trị trên:
+
+```bash
+cp .env.example .env
+```
 
 ## Luồng xử lý
 
