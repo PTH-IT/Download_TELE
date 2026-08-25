@@ -368,9 +368,9 @@
         </div>
       </section>
     </div>
-<script src="config.js"></script>
+<script src="config.js?v=3"></script>
 <script>
-      const API_BASE = (window.API_BASE || `${location.protocol}//${location.hostname || "localhost"}:8000`).replace(/\/$/, "");
+      const API_BASE = (window.API_BASE || "").replace(/\/$/, "");
 
       // Check auth state and redirect to login if not authenticated
       async function checkAuth() {
@@ -513,7 +513,7 @@ tbody.innerHTML = jobs.map(job => {
     }
 
     function connectProgressWS() {
-      const url = new URL(API_BASE);
+      const url = new URL(API_BASE || window.location.origin);
       const wsProto = url.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = `${wsProto}//${url.host}/ws/progress`;
 

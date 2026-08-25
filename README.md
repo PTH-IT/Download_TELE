@@ -26,14 +26,17 @@ docker compose up -d --build
 - Dashboard: http://localhost:3000
 - API: http://localhost:8000 (đổi bằng biến `API_PORT`)
 
-Nếu máy đã có postgres/redis/dịch vụ khác chiếm cổng, đặt `PG_PORT`,
-`REDIS_PORT`, `API_PORT`, `WEB_PORT` trong `.env`. Dashboard tự lấy đúng cổng
-API từ `API_PORT` (server sinh `/config.js` lúc chạy), nên **không cần sửa file
-js**. Kiểm tra nhanh bằng `curl http://localhost:<WEB_PORT>/config.js`.
+Trình duyệt chỉ gọi đúng origin của dashboard: `web/server.py` proxy `/api` và
+`/ws` sang API qua mạng nội bộ docker. Nhờ vậy đổi `API_PORT` hay bị ứng dụng
+khác chiếm cổng 8000 cũng không ảnh hưởng tới dashboard.
 
-Nếu API nằm ở host khác, đặt thẳng `API_BASE=http://ip-may-chu:8000` trong
-`.env`. Muốn đổi tạm thời cho một trình duyệt: mở dashboard với
-`?api=http://localhost:<cổng>`.
+Nếu máy đã có postgres/redis/dịch vụ khác chiếm cổng, đặt `PG_PORT`,
+`REDIS_PORT`, `API_PORT`, `WEB_PORT` trong `.env`. Cổng `API_PORT` chỉ dùng khi
+bạn muốn gọi API trực tiếp (curl, Postman); dashboard không cần tới nó.
+
+Muốn dashboard gọi thẳng một API ở máy khác (bỏ qua proxy), đặt
+`API_BASE=http://ip-may-chu:8000` trong `.env`, hoặc mở dashboard với
+`?api=http://ip-may-chu:8000` (xoá bằng `?api=`).
 
 Lần đầu vào dashboard sẽ bị chuyển sang `/login.html` để đăng nhập Telegram bằng
 số điện thoại + OTP. Worker giữ khoá `lock:auth_session` là bên gửi OTP và tạo
