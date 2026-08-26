@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.models import Job, Task
 from shared.constants import (
+    JOB_STATUS_CANCELLED,
     JOB_STATUS_DONE,
     JOB_STATUS_RUNNING,
     TASK_STATUS_DONE,
@@ -28,6 +29,17 @@ async def update_task_status(db: AsyncSession, task_id: int, status: str, **fiel
     values = {"status": status, "updated_at": datetime.utcnow()}
     values.update(fields)
     await db.execute(update(Task).where(Task.id == task_id).values(**values))
+
+
+async def job_is_cancelled(db: AsyncSession, job_id: int) -> bool:
+    """CHỈ trạng thái cancelled mới được phép bỏ việc đang làm.
+
+    Không dùng "có phải đang running không": job bị đóng sớm thành done (hoặc
+    vừa retry xong chưa kịp mở lại) sẽ khiến task tải xong 100% rồi bị đánh
+    cancelled, vứt luôn file vừa tải.
+    """
+    res = await db.execute(select(Job.status).where(Job.id == job_id))
+    return res.scalar_one_or_none() == JOB_STATUS_CANCELLED
 
 
 async def count_task_statuses(db: AsyncSession, job_id: int) -> dict[str, int]:

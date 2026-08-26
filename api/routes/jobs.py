@@ -187,6 +187,12 @@ async def retry_task(
     task.error = None
     task.worker_id = None
     task.attempt = 0
+
+    # Mở lại job: nếu job vẫn ở done/cancelled thì worker sẽ coi task này là
+    # việc thừa và huỷ ngay sau khi tải xong.
+    job = await db.get(Job, job_id)
+    if job and job.status != JOB_STATUS_RUNNING:
+        job.status = JOB_STATUS_RUNNING
     await db.commit()
 
     await redis.zadd(QUEUE_DOWNLOAD, {str(task.id): 0})

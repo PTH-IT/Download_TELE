@@ -40,9 +40,8 @@ from shared.constants import (
     TASK_STATUS_FAILED,
     TASK_STATUS_CANCELLED,
     JOB_STATUS_CANCELLED,
-    JOB_STATUS_RUNNING,
 )
-from shared.job_state import refresh_job_counters, update_task_status
+from shared.job_state import job_is_cancelled, refresh_job_counters, update_task_status
 from shared.peers import normalize_peer
 from shared.phone import InvalidPhoneNumber, mask_phone, normalize_phone
 
@@ -518,7 +517,7 @@ async def _handle_download(
         await db.commit()
 
         # Job có thể bị huỷ trong lúc đang tải — bỏ file thay vì upload thừa
-        if not await _job_is_active(db, job.id):
+        if await job_is_cancelled(db, job.id):
             await update_task_status(db, task_id, TASK_STATUS_CANCELLED)
             await db.commit()
             try:
@@ -827,12 +826,6 @@ async def _iter_messages(app: Client, peer, start: int, end: int):
             yield msg
 
 
-async def _job_is_active(db: AsyncSession, job_id: int) -> bool:
-    res = await db.execute(select(Job.status).where(Job.id == job_id))
-    status = res.scalar_one_or_none()
-    return status == JOB_STATUS_RUNNING
-
-
 async def _create_task_row(db: AsyncSession, r: aioredis.Redis, job_id: int, msg) -> bool:
     existing = await db.execute(
         select(Task.id).where(Task.job_id == job_id, Task.msg_id == msg.id).limit(1)
@@ -933,7 +926,7 @@ async def _process_new_job(app: Client, r: aioredis.Redis, job_req: dict, stop_e
                     if created % 50 == 0:
                         await refresh_job_counters(db, job_id)
                         await db.commit()
-                        if not await _job_is_active(db, job_id):
+                        if await job_is_cancelled(db, job_id):
                             log.info("Job %s đã bị huỷ, dừng quét", job_id)
                             break
         else:
@@ -951,7 +944,7 @@ async def _process_new_job(app: Client, r: aioredis.Redis, job_req: dict, stop_e
                     if created % 50 == 0:
                         await refresh_job_counters(db, job_id)
                         await db.commit()
-                        if not await _job_is_active(db, job_id):
+                        if await job_is_cancelled(db, job_id):
                             log.info("Job %s đã bị huỷ, dừng quét", job_id)
                             break
 

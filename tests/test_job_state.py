@@ -14,7 +14,7 @@ from shared.constants import (
     TASK_STATUS_PENDING,
     TASK_STATUS_UPLOADING,
 )
-from shared.job_state import refresh_job_counters, update_task_status
+from shared.job_state import job_is_cancelled, refresh_job_counters, update_task_status
 
 
 async def make_session_factory(tmp_path):
@@ -118,3 +118,17 @@ async def test_retried_task_reopens_finished_job(tmp_path):
         job = await db.get(Job, job_id, populate_existing=True)
         assert job.status == JOB_STATUS_RUNNING
         assert (job.total, job.done, job.failed) == (2, 1, 0)
+
+
+@pytest.mark.asyncio
+async def test_job_is_cancelled_only_for_cancelled_status(tmp_path):
+    """Regression: job 'done' KHÔNG được coi là lý do huỷ task vừa tải xong."""
+    session_factory = await make_session_factory(tmp_path)
+    async with session_factory() as db:
+        running = await _seed(db, [TASK_STATUS_PENDING], job_status=JOB_STATUS_RUNNING)
+        done = await _seed(db, [TASK_STATUS_DONE], job_status=JOB_STATUS_DONE)
+        cancelled = await _seed(db, [TASK_STATUS_PENDING], job_status=JOB_STATUS_CANCELLED)
+
+        assert await job_is_cancelled(db, running) is False
+        assert await job_is_cancelled(db, done) is False
+        assert await job_is_cancelled(db, cancelled) is True
