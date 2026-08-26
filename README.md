@@ -71,6 +71,7 @@ key).
 | `MAX_DL` / `MAX_UP` | `2` / `4` | số download/upload song song mỗi worker |
 | `SESSION_STRING` | — | session Telegram riêng cho worker đó |
 | `MAX_ATTEMPTS` | `3` | số lần thử lại trước khi task bị đánh `failed` |
+| `MAX_TRANSIENT_ATTEMPTS` | `12` | số lần thử lại riêng cho lỗi mạng tạm thời |
 | `SCAN_CAP` | `200` | số message quét khi job không chỉ định khoảng msg_id |
 | `DELETE_AFTER_UPLOAD` | `1` | xoá file sau khi upload xong |
 | `LOG_LEVEL` | `INFO` | mức log của worker |

@@ -93,3 +93,28 @@ async def test_refresh_job_counters_does_not_resurrect_cancelled_job(tmp_path):
 
         job = await db.get(Job, job_id, populate_existing=True)
         assert job.status == JOB_STATUS_CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_retried_task_reopens_finished_job(tmp_path):
+    """Task failed được retry -> pending: job đã done phải mở lại thành running."""
+    session_factory = await make_session_factory(tmp_path)
+    async with session_factory() as db:
+        job_id = await _seed(db, [TASK_STATUS_DONE, TASK_STATUS_FAILED])
+
+        await refresh_job_counters(db, job_id)
+        await db.commit()
+        job = await db.get(Job, job_id, populate_existing=True)
+        assert job.status == JOB_STATUS_DONE
+
+        # retry: task failed quay lại pending
+        failed_id = (
+            await db.execute(select(Task.id).where(Task.status == TASK_STATUS_FAILED))
+        ).scalar_one()
+        await update_task_status(db, failed_id, TASK_STATUS_PENDING)
+        await refresh_job_counters(db, job_id)
+        await db.commit()
+
+        job = await db.get(Job, job_id, populate_existing=True)
+        assert job.status == JOB_STATUS_RUNNING
+        assert (job.total, job.done, job.failed) == (2, 1, 0)

@@ -3,9 +3,9 @@ import json
 import time
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
@@ -230,26 +230,62 @@ async def retry_failed_tasks(
 async def job_tasks(
     job_id: int,
     status: Optional[str] = None,
-    limit: int = 200,
+    q: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
     db: AsyncSession = Depends(get_db),
 ):
-    q = select(Task).where(Task.job_id == job_id)
+    """Danh sách task có phân trang.
+
+    Trả về kèm `total` (số task khớp bộ lọc) và `counts` (số task theo từng
+    trạng thái, không phụ thuộc bộ lọc) để client vẽ được thanh phân trang và
+    các nút lọc mà không phải tải toàn bộ task về.
+    """
+    filters = [Task.job_id == job_id]
     if status:
-        q = q.where(Task.status == status.lower())
-    q = q.order_by(Task.id.desc()).limit(limit)
-    result = await db.execute(q)
+        filters.append(Task.status == status.lower())
+    if q:
+        term = q.strip()
+        if term.isdigit():
+            value = int(term)
+            filters.append(or_(Task.msg_id == value, Task.id == value))
+        elif term:
+            filters.append(Task.error.ilike(f"%{term}%"))
+
+    total = await db.scalar(select(func.count()).select_from(Task).where(*filters))
+
+    counts_result = await db.execute(
+        select(Task.status, func.count())
+        .where(Task.job_id == job_id)
+        .group_by(Task.status)
+    )
+    counts = {row[0]: int(row[1]) for row in counts_result.all()}
+
+    order_by = Task.id.asc() if order == "asc" else Task.id.desc()
+    result = await db.execute(
+        select(Task).where(*filters).order_by(order_by).limit(limit).offset(offset)
+    )
     tasks = result.scalars().all()
-    return [
-        {
-            "id": t.id,
-            "msg_id": t.msg_id,
-            "status": t.status,
-            "worker_id": t.worker_id,
-            "speed_dl": round(t.speed_dl / (1 << 20), 2) if t.speed_dl else 0,
-            "speed_up": round(t.speed_up / (1 << 20), 2) if t.speed_up else 0,
-            "size_mb": round(t.size_bytes / (1 << 20), 1) if t.size_bytes else 0,
-            "error": t.error,
-            "updated_at": t.updated_at.isoformat() if t.updated_at else None,
-        }
-        for t in tasks
-    ]
+
+    return {
+        "items": [
+            {
+                "id": t.id,
+                "msg_id": t.msg_id,
+                "status": t.status,
+                "worker_id": t.worker_id,
+                "speed_dl": round(t.speed_dl / (1 << 20), 2) if t.speed_dl else 0,
+                "speed_up": round(t.speed_up / (1 << 20), 2) if t.speed_up else 0,
+                "size_mb": round(t.size_bytes / (1 << 20), 1) if t.size_bytes else 0,
+                "error": t.error,
+                "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+            }
+            for t in tasks
+        ],
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+        "order": order,
+        "counts": counts,
+    }

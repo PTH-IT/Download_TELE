@@ -170,6 +170,78 @@
       @media (max-width: 768px) {
         .info-grid { grid-template-columns: 1fr; }
       }
+
+      .table-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px 18px;
+        align-items: flex-end;
+        margin-bottom: 14px;
+      }
+      .table-toolbar label {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        font-size: 0.78rem;
+        color: var(--muted);
+      }
+      .table-toolbar select,
+      .table-toolbar input {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 8px;
+        color: inherit;
+        padding: 7px 10px;
+        font: inherit;
+        font-size: 0.85rem;
+        min-width: 150px;
+      }
+      .table-toolbar input:focus,
+      .table-toolbar select:focus {
+        outline: none;
+        border-color: rgba(255, 255, 255, 0.4);
+      }
+      .pagination {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 14px;
+      }
+      .page-info {
+        font-size: 0.82rem;
+        color: var(--muted);
+      }
+      .page-controls {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .page-numbers {
+        display: flex;
+        gap: 4px;
+      }
+      .page-btn {
+        padding: 6px 11px;
+        font-size: 0.82rem;
+        min-width: 38px;
+      }
+      .page-btn[disabled] {
+        opacity: 0.35;
+        cursor: not-allowed;
+      }
+      .page-btn.is-current {
+        background: rgba(255, 255, 255, 0.16);
+        border-color: rgba(255, 255, 255, 0.35);
+        font-weight: 600;
+      }
+      .page-gap {
+        padding: 6px 4px;
+        color: var(--muted);
+        font-size: 0.82rem;
+      }
     </style>
   </head>
   <body>
@@ -227,6 +299,43 @@
             <h2>Danh sách Task</h2>
             <span class="pill" id="tasksCount">0 task</span>
           </div>
+
+          <div class="table-toolbar">
+            <label>
+              Trạng thái
+              <select id="filterStatus">
+                <option value="">Tất cả</option>
+                <option value="pending">Pending</option>
+                <option value="downloading">Downloading</option>
+                <option value="uploading">Uploading</option>
+                <option value="done">Done</option>
+                <option value="failed">Failed</option>
+                <option value="cancelled">Cancelled</option>
+              </select>
+            </label>
+            <label>
+              Tìm
+              <input id="filterSearch" type="search" placeholder="task id, msg id hoặc nội dung lỗi" />
+            </label>
+            <label>
+              Mỗi trang
+              <select id="pageSize">
+                <option value="25">25</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+              </select>
+            </label>
+            <label>
+              Sắp xếp
+              <select id="sortOrder">
+                <option value="desc">Mới nhất trước</option>
+                <option value="asc">Cũ nhất trước</option>
+              </select>
+            </label>
+          </div>
+
           <div class="table-wrapper">
             <table>
               <thead>
@@ -245,6 +354,17 @@
               <tbody id="tasksTbody">
               </tbody>
             </table>
+          </div>
+
+          <div class="pagination">
+            <span id="pageInfo" class="page-info">—</span>
+            <div class="page-controls">
+              <button class="btn btn-secondary page-btn" id="pageFirst" title="Trang đầu">«</button>
+              <button class="btn btn-secondary page-btn" id="pagePrev">Trước</button>
+              <span id="pageNumbers" class="page-numbers"></span>
+              <button class="btn btn-secondary page-btn" id="pageNext">Sau</button>
+              <button class="btn btn-secondary page-btn" id="pageLast" title="Trang cuối">»</button>
+            </div>
           </div>
         </div>
       </section>
@@ -294,10 +414,32 @@
         return await res.json();
       }
 
+      // Trạng thái bảng — phân trang chạy ở server nên job vài nghìn task vẫn nhẹ.
+      const tableState = {
+        offset: 0,
+        limit: 50,
+        status: "",
+        q: "",
+        order: "desc",
+        total: 0,
+      };
+
       async function fetchJobTasks(jobId) {
-        const res = await fetch(`${API_BASE}/api/jobs/${jobId}/tasks`, { method: "GET" });
+        const params = new URLSearchParams({
+          limit: String(tableState.limit),
+          offset: String(tableState.offset),
+          order: tableState.order,
+        });
+        if (tableState.status) params.set("status", tableState.status);
+        if (tableState.q) params.set("q", tableState.q);
+
+        const res = await fetch(`${API_BASE}/api/jobs/${jobId}/tasks?${params}`, { method: "GET" });
         if (!res.ok) throw new Error(`tasks: ${res.status}`);
-        return await res.json();
+        const data = await res.json();
+        // API cũ trả về mảng thuần — giữ tương thích để không vỡ khi lệch phiên bản
+        return Array.isArray(data)
+          ? { items: data, total: data.length, counts: {}, limit: tableState.limit, offset: 0 }
+          : data;
       }
 
       function formatStatus(status) {
@@ -338,14 +480,26 @@
           const progressPercent = total > 0 ? Math.round((done / total) * 100) : 0;
           document.getElementById("progressBar").style.width = `${Math.min(progressPercent, 100)}%`;
 
-          document.getElementById("tasksCount").textContent = `${Array.isArray(tasks) ? tasks.length : 0} task`;
+          tableState.total = Number(tasks.total || 0);
+          const items = tasks.items || [];
+          const allCount = Object.values(tasks.counts || {}).reduce((a, b) => a + b, 0);
+          document.getElementById("tasksCount").textContent =
+            tableState.status || tableState.q
+              ? `${tableState.total} / ${allCount} task`
+              : `${tableState.total} task`;
+          renderStatusOptions(tasks.counts || {});
 
           const tbody = document.getElementById("tasksTbody");
-          if (!Array.isArray(tasks) || tasks.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; color:var(--muted); padding:24px 0;">Chưa có task nào được tạo cho job này.</td></tr>`;
+          if (items.length === 0) {
+            const msg = tableState.status || tableState.q
+              ? "Không có task nào khớp bộ lọc."
+              : "Chưa có task nào được tạo cho job này.";
+            tbody.innerHTML = `<tr><td colspan="9" style="text-align:center; color:var(--muted); padding:24px 0;">${msg}</td></tr>`;
+            renderPagination();
+            showCancelButton(job);
             return;
           }
-          tbody.innerHTML = tasks.map(t => {
+          tbody.innerHTML = items.map(t => {
             const taskStatus = formatStatus(t.status);
             const canRetry = (t.status || "").toLowerCase() === "failed" || (t.status || "").toLowerCase() === "cancelled";
             return `
@@ -363,12 +517,86 @@
             `;
           }).join("");
 
-          const canCancel = (job.status || "").toLowerCase() !== "cancelled" && (job.status || "").toLowerCase() !== "done";
-          document.getElementById("btnCancel").style.display = canCancel ? "inline-block" : "none";
+          renderPagination();
+          showCancelButton(job);
         } catch (e) {
           console.error("Failed to load job detail:", e);
           document.getElementById("jobId").textContent = "Not found";
         }
+      }
+
+
+      function showCancelButton(job) {
+        const st = (job.status || "").toLowerCase();
+        const canCancel = st !== "cancelled" && st !== "done";
+        document.getElementById("btnCancel").style.display = canCancel ? "inline-block" : "none";
+      }
+
+      // Gắn số lượng vào từng lựa chọn trạng thái, giữ nguyên lựa chọn hiện tại
+      function renderStatusOptions(counts) {
+        const select = document.getElementById("filterStatus");
+        const labels = {
+          "": "Tất cả",
+          pending: "Pending",
+          downloading: "Downloading",
+          uploading: "Uploading",
+          done: "Done",
+          failed: "Failed",
+          cancelled: "Cancelled",
+        };
+        const totalAll = Object.values(counts).reduce((a, b) => a + b, 0);
+        for (const opt of select.options) {
+          const base = labels[opt.value] ?? opt.value;
+          const n = opt.value === "" ? totalAll : counts[opt.value] || 0;
+          opt.textContent = `${base} (${n})`;
+        }
+      }
+
+      function pageNumbersFor(current, last) {
+        // 1 ... 4 5 [6] 7 8 ... 20
+        const pages = new Set([1, last, current, current - 1, current + 1]);
+        if (current <= 3) [2, 3, 4].forEach(p => pages.add(p));
+        if (current >= last - 2) [last - 1, last - 2, last - 3].forEach(p => pages.add(p));
+        return [...pages].filter(p => p >= 1 && p <= last).sort((a, b) => a - b);
+      }
+
+      function renderPagination() {
+        const { offset, limit, total } = tableState;
+        const last = Math.max(1, Math.ceil(total / limit));
+        const current = Math.floor(offset / limit) + 1;
+        const from = total === 0 ? 0 : offset + 1;
+        const to = Math.min(offset + limit, total);
+
+        document.getElementById("pageInfo").textContent =
+          total === 0
+            ? "Không có task nào"
+            : `Hiển thị ${from}\u2013${to} trong ${total} task \u00b7 trang ${current}/${last}`;
+
+        document.getElementById("pageFirst").disabled = current <= 1;
+        document.getElementById("pagePrev").disabled = current <= 1;
+        document.getElementById("pageNext").disabled = current >= last;
+        document.getElementById("pageLast").disabled = current >= last;
+
+        const container = document.getElementById("pageNumbers");
+        const nums = pageNumbersFor(current, last);
+        let html = "";
+        let prev = 0;
+        for (const p of nums) {
+          if (prev && p - prev > 1) html += `<span class="page-gap">\u2026</span>`;
+          html += `<button class="btn btn-secondary page-btn${p === current ? " is-current" : ""}" data-page="${p}">${p}</button>`;
+          prev = p;
+        }
+        container.innerHTML = html;
+        container.querySelectorAll("button[data-page]").forEach(btn => {
+          btn.addEventListener("click", () => goToPage(Number(btn.dataset.page)));
+        });
+      }
+
+      function goToPage(page) {
+        const last = Math.max(1, Math.ceil(tableState.total / tableState.limit));
+        const target = Math.min(Math.max(1, page), last);
+        tableState.offset = (target - 1) * tableState.limit;
+        renderJobDetail();
       }
 
       async function cancelJob() {
@@ -399,8 +627,54 @@
         if (!authenticated) return;
 
         document.getElementById("btnCancel").addEventListener("click", cancelJob);
+
+        document.getElementById("filterStatus").addEventListener("change", (e) => {
+          tableState.status = e.target.value;
+          tableState.offset = 0;
+          renderJobDetail();
+        });
+
+        document.getElementById("sortOrder").addEventListener("change", (e) => {
+          tableState.order = e.target.value;
+          tableState.offset = 0;
+          renderJobDetail();
+        });
+
+        document.getElementById("pageSize").addEventListener("change", (e) => {
+          tableState.limit = Number(e.target.value);
+          tableState.offset = 0;
+          renderJobDetail();
+        });
+
+        // debounce để không gọi API sau mỗi phím gõ
+        let searchTimer = null;
+        const searchInput = document.getElementById("filterSearch");
+        searchInput.addEventListener("input", (e) => {
+          clearTimeout(searchTimer);
+          searchTimer = setTimeout(() => {
+            tableState.q = e.target.value.trim();
+            tableState.offset = 0;
+            renderJobDetail();
+          }, 350);
+        });
+
+        document.getElementById("pageFirst").addEventListener("click", () => goToPage(1));
+        document.getElementById("pagePrev").addEventListener("click", () =>
+          goToPage(Math.floor(tableState.offset / tableState.limit))
+        );
+        document.getElementById("pageNext").addEventListener("click", () =>
+          goToPage(Math.floor(tableState.offset / tableState.limit) + 2)
+        );
+        document.getElementById("pageLast").addEventListener("click", () =>
+          goToPage(Math.ceil(tableState.total / tableState.limit))
+        );
+
         renderJobDetail();
-        setInterval(renderJobDetail, 5000);
+        // Tự làm mới nhưng giữ nguyên trang/bộ lọc; dừng khi đang gõ tìm kiếm
+        setInterval(() => {
+          if (document.activeElement === searchInput) return;
+          renderJobDetail();
+        }, 5000);
       });
     </script>
   </body>

@@ -58,6 +58,16 @@ async def refresh_job_counters(db: AsyncSession, job_id: int) -> dict[str, int]:
         # chỉ đóng job đang chạy, không đụng vào job đã cancel
         values["status"] = JOB_STATUS_DONE
         stmt = stmt.where(Job.status == JOB_STATUS_RUNNING)
+    elif active > 0:
+        # Task failed được retry sẽ quay lại pending. Nếu job đã bị đóng trước
+        # đó thì phải mở lại, nếu không dashboard báo "done" trong khi worker
+        # vẫn đang chạy hàng trăm task.
+        values["status"] = JOB_STATUS_RUNNING
+        stmt = stmt.where(Job.status == JOB_STATUS_DONE)
+        await db.execute(stmt.values(**values))
+        # câu lệnh trên chỉ chạm job đang done; cập nhật counter cho phần còn lại
+        values.pop("status")
+        stmt = update(Job).where(Job.id == job_id)
 
     await db.execute(stmt.values(**values))
     return values

@@ -109,6 +109,10 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/app/downloads")
 DELETE_AFTER_UPLOAD = os.getenv("DELETE_AFTER_UPLOAD", "1") not in ("0", "false", "False")
 
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
+# Lỗi mạng tạm thời (Broken pipe, timeout, Telegram ngắt kết nối) không phải
+# lỗi của task. Nếu tính chung MAX_ATTEMPTS thì chỉ cần vài lần rớt mạng là
+# task bị đánh failed vĩnh viễn dù file hoàn toàn tải được.
+MAX_TRANSIENT_ATTEMPTS = int(os.getenv("MAX_TRANSIENT_ATTEMPTS", "12"))
 # TTL ngắn + gia hạn định kỳ trong lúc chạy. Nếu để TTL dài (kiểu 1 giờ) thì
 # worker chết giữa chừng vẫn "giữ" task đến hết TTL, janitor không dám nhận lại
 # và task treo ở trạng thái downloading suốt thời gian đó.
@@ -335,6 +339,28 @@ async def command_listener(
 # --------------------------------------------------------------------------
 # DB helpers
 # --------------------------------------------------------------------------
+_TRANSIENT_MARKERS = (
+    "broken pipe",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "nonetype' object has no attribute 'write'",
+)
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """Lỗi kết nối tạm thời — thử lại được, không phải task hỏng."""
+    if isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
+        return True
+    if isinstance(exc, OSError):
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
 async def fail_or_retry(
     r: aioredis.Redis,
     db: AsyncSession,
@@ -342,16 +368,23 @@ async def fail_or_retry(
     queue: str,
     error: str,
     stats: WorkerStats,
+    transient: bool = False,
 ):
     """Task lỗi: còn lượt thì đẩy lại hàng đợi, hết lượt thì đánh failed."""
     attempt = (task.attempt or 0) + 1
-    if attempt < MAX_ATTEMPTS:
+    budget = MAX_TRANSIENT_ATTEMPTS if transient else MAX_ATTEMPTS
+    if attempt < budget:
         await update_task_status(
             db, task.id, TASK_STATUS_PENDING, attempt=attempt, error=error[:2000]
         )
         await db.commit()
-        await r.zadd(queue, {str(task.id): time.time() + 30})
-        log.warning("Task %s lỗi (lần %s/%s), sẽ thử lại: %s", task.id, attempt, MAX_ATTEMPTS, error)
+        # backoff tăng dần cho lỗi mạng, tránh đập liên tục vào Telegram
+        delay = min(300, 15 * attempt) if transient else 30
+        await r.zadd(queue, {str(task.id): time.time() + delay})
+        log.warning(
+            "Task %s lỗi (lần %s/%s, thử lại sau %ss): %s",
+            task.id, attempt, budget, delay, error,
+        )
         return
 
     await update_task_status(db, task.id, TASK_STATUS_FAILED, attempt=attempt, error=error[:2000])
@@ -517,7 +550,10 @@ async def _handle_download(
         await db.rollback()
         task = await db.get(Task, task_id)
         if task:
-            await fail_or_retry(r, db, task, QUEUE_DOWNLOAD, f"{type(e).__name__}: {e}", stats)
+            await fail_or_retry(
+                r, db, task, QUEUE_DOWNLOAD, f"{type(e).__name__}: {e}", stats,
+                transient=is_transient_error(e),
+            )
     finally:
         stats.current_task = None
 
@@ -719,7 +755,10 @@ async def _handle_upload(
         await db.rollback()
         task = await db.get(Task, task_id)
         if task:
-            await fail_or_retry(r, db, task, QUEUE_UPLOAD, f"{type(e).__name__}: {e}", stats)
+            await fail_or_retry(
+                r, db, task, QUEUE_UPLOAD, f"{type(e).__name__}: {e}", stats,
+                transient=is_transient_error(e),
+            )
     finally:
         stats.current_task = None
 
