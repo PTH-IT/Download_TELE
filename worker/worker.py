@@ -481,26 +481,47 @@ async def _handle_download(
         local_path = os.path.join(DOWNLOAD_DIR, filename)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        stats.active_dl += 1
-        try:
-            async with dl_sem:
-                start = time.time()
-                path = await app.download_media(
-                    msg,
-                    file_name=local_path,
-                    progress=make_progress_cb(r, "dl", task_id, job.id, stats),
-                )
-        finally:
-            stats.active_dl -= 1
+        # Task fail ở bước upload rồi retry sẽ quay lại hàng đợi download. Nếu
+        # file đã tải xong và đủ dung lượng thì dùng lại, đừng tải lại vài GB.
+        expected_size = get_media_size(msg)
+        if (
+            expected_size
+            and os.path.exists(local_path)
+            and os.path.getsize(local_path) == expected_size
+        ):
+            log.info(
+                "Task %s đã có sẵn file đủ %s byte, bỏ qua tải lại", task_id, expected_size
+            )
+            path, size, speed = local_path, expected_size, 0.0
+        else:
+            stats.active_dl += 1
+            try:
+                async with dl_sem:
+                    start = time.time()
+                    path = await app.download_media(
+                        msg,
+                        file_name=local_path,
+                        progress=make_progress_cb(r, "dl", task_id, job.id, stats),
+                    )
+            finally:
+                stats.active_dl -= 1
 
-        # download_media nuốt exception và trả None khi tải lỗi
-        if not path or not os.path.exists(path):
-            raise RuntimeError("Tải file thất bại (Pyrogram trả về None)")
+            # download_media nuốt exception và trả None khi tải lỗi
+            if not path or not os.path.exists(path):
+                raise RuntimeError("Tải file thất bại (Pyrogram trả về None)")
 
-        elapsed = max(0.001, time.time() - start)
-        size = os.path.getsize(path)
-        speed = size / elapsed
-        stats.dl_speed = speed
+            elapsed = max(0.001, time.time() - start)
+            size = os.path.getsize(path)
+            speed = size / elapsed
+            stats.dl_speed = speed
+
+        if size == 0:
+            # Pyrogram tạo file rỗng khi media hỏng/không tải được
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise RuntimeError("File tải về rỗng (0 byte)")
 
         await update_task_status(
             db,
