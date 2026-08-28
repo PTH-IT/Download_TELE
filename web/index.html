@@ -425,8 +425,23 @@
       return await res.json();
     }
 
+    // Worker gửi type ngắn gọn: dl, up, dl_done, up_done, task_failed...
+    const FEED_LABELS = {
+      dl: { label: "Đang tải", cls: "dot-running" },
+      up: { label: "Đang upload", cls: "dot-running" },
+      dl_done: { label: "Tải xong", cls: "dot-running" },
+      up_done: { label: "Hoàn tất", cls: "dot-done" },
+      task_failed: { label: "Lỗi", cls: "dot-failed" },
+      job_error: { label: "Lỗi job", cls: "dot-failed" },
+      job_enqueued: { label: "Đã nạp job", cls: "dot-pending" },
+    };
+
     function statusBadge(status) {
       const s = (status || "").toLowerCase();
+      if (FEED_LABELS[s]) {
+        const { label, cls } = FEED_LABELS[s];
+        return `<span class="status"><span class="dot ${cls}"></span>${label}</span>`;
+      }
       let label = "Queued";
       if (s.includes("upload")) label = "Uploading";
       else if (s.includes("download") || s.includes("downloading")) label = "Downloading";
@@ -484,7 +499,13 @@ tbody.innerHTML = jobs.map(job => {
       const current = payload.current;
       const total = payload.total;
       const rowKey = String(identifier ?? payload.job_id ?? payload.task_id ?? payload.msg_id ?? type ?? "event");
-      const displayId = payload.job_id ? `JOB-${payload.job_id}` : identifier ? `#${identifier}` : "event";
+      const displayId = payload.task_id
+        ? `#${payload.task_id}${payload.job_id ? ` · JOB-${payload.job_id}` : ""}`
+        : payload.job_id
+        ? `JOB-${payload.job_id}`
+        : identifier
+        ? `#${identifier}`
+        : "event";
 
       const existing = tbody.querySelector(`[data-vid="${rowKey}"]`);
       let row = existing;
@@ -506,9 +527,18 @@ tbody.innerHTML = jobs.map(job => {
       const speedCell = row.children[3];
       const downloadedCell = row.children[4];
 
+      // payload.speed là byte/giây do worker tính. Trước đây chỗ này lấy
+      // `current` (số byte đã truyền) rồi gắn đuôi "MB/s" nên hiện ra những
+      // con số vô lý kiểu "231 MB/s".
+      const percent =
+        typeof current === "number" && typeof total === "number" && total > 0
+          ? ` (${((current / total) * 100).toFixed(0)}%)`
+          : "";
       const speed =
-        (typeof current === "number" && typeof total === "number" && total > 0)
-          ? `${((current / 1024 / 1024).toFixed(1))} MB/s (${((current / total) * 100).toFixed(0)}%)`
+        typeof payload.speed === "number" && payload.speed > 0
+          ? `${(payload.speed / 1024 / 1024).toFixed(2)} MB/s${percent}`
+          : percent
+          ? `—${percent}`
           : "—";
 
       const downloaded =
@@ -562,7 +592,17 @@ tbody.innerHTML = jobs.map(job => {
         const totalCount = Array.isArray(workers) ? workers.length : 0;
         setText("workersStrong", `${onlineCount} online / ${totalCount} registered`);
 
-        setText("transferRateStrong", `DL: ${stats.tasks?.downloading ?? 0} / UP: ${stats.tasks?.uploading ?? 0}`);
+        // Tổng băng thông thực tế của các worker, không phải số lượng task
+        const dlRate = (Array.isArray(workers) ? workers : [])
+          .filter(w => w.online)
+          .reduce((a, w) => a + (Number(w.dl_speed_mbs) || 0), 0);
+        const upRate = (Array.isArray(workers) ? workers : [])
+          .filter(w => w.online)
+          .reduce((a, w) => a + (Number(w.up_speed_mbs) || 0), 0);
+        setText(
+          "transferRateStrong",
+          `DL ${dlRate.toFixed(2)} MB/s · UP ${upRate.toFixed(2)} MB/s`
+        );
 
         const pending = stats.tasks?.pending ?? 0;
         const downloading = stats.tasks?.downloading ?? 0;

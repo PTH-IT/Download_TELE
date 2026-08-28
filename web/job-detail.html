@@ -287,8 +287,12 @@
             </div>
           </div>
 
-          <div style="margin-top: 16px;">
+          <div style="margin-top: 16px; display:flex; gap:10px; flex-wrap:wrap;">
             <button class="btn btn-secondary" id="btnCancel" style="display:none;">Hủy Job</button>
+            <button class="btn btn-secondary" id="btnRetryFailed" style="display:none;">
+              Retry tất cả task lỗi
+            </button>
+            <span id="retryResult" style="align-self:center; font-size:0.82rem; color:var(--muted);"></span>
           </div>
         </div>
       </section>
@@ -497,6 +501,7 @@
             tbody.innerHTML = `<tr><td colspan="9" style="text-align:center; color:var(--muted); padding:24px 0;">${msg}</td></tr>`;
             renderPagination();
             showCancelButton(job);
+            showRetryButton(tasks.counts || {});
             return;
           }
           tbody.innerHTML = items.map(t => {
@@ -519,6 +524,7 @@
 
           renderPagination();
           showCancelButton(job);
+          showRetryButton(tasks.counts || {});
         } catch (e) {
           console.error("Failed to load job detail:", e);
           document.getElementById("jobId").textContent = "Not found";
@@ -530,6 +536,43 @@
         const st = (job.status || "").toLowerCase();
         const canCancel = st !== "cancelled" && st !== "done";
         document.getElementById("btnCancel").style.display = canCancel ? "inline-block" : "none";
+      }
+
+      // Số task retry được = failed + cancelled (theo counts của API)
+      function showRetryButton(counts) {
+        const n = (counts.failed || 0) + (counts.cancelled || 0);
+        const btn = document.getElementById("btnRetryFailed");
+        btn.style.display = n > 0 ? "inline-block" : "none";
+        btn.textContent = `Retry tất cả task lỗi (${n})`;
+        btn.dataset.count = String(n);
+      }
+
+      async function retryAllFailed() {
+        const jobId = getJobIdFromUrl();
+        const btn = document.getElementById("btnRetryFailed");
+        const out = document.getElementById("retryResult");
+        const n = Number(btn.dataset.count || 0);
+
+        if (!confirm(
+          `Đẩy lại ${n} task lỗi vào hàng đợi?\n\n` +
+          `File đã tải xong sẽ được dùng lại, phần còn lại phải tải từ đầu.`
+        )) return;
+
+        btn.disabled = true;
+        out.textContent = "Đang đẩy lại...";
+        try {
+          const res = await fetch(`${API_BASE}/api/jobs/${jobId}/retry_failed`, { method: "POST" });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || `Lỗi ${res.status}`);
+          out.textContent = `Đã đẩy lại ${data.requeued ?? 0} task.`;
+          tableState.offset = 0;
+          await renderJobDetail();
+        } catch (e) {
+          out.textContent = `Thất bại: ${e.message}`;
+        } finally {
+          btn.disabled = false;
+          setTimeout(() => { out.textContent = ""; }, 8000);
+        }
       }
 
       // Gắn số lượng vào từng lựa chọn trạng thái, giữ nguyên lựa chọn hiện tại
@@ -627,6 +670,7 @@
         if (!authenticated) return;
 
         document.getElementById("btnCancel").addEventListener("click", cancelJob);
+        document.getElementById("btnRetryFailed").addEventListener("click", retryAllFailed);
 
         document.getElementById("filterStatus").addEventListener("change", (e) => {
           tableState.status = e.target.value;

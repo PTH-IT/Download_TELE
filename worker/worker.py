@@ -181,14 +181,33 @@ class WorkerStats:
 
     def __init__(self):
         self.session_state = "waiting_auth"
-        self.dl_speed = 0.0
-        self.up_speed = 0.0
         self.total_done = 0
         self.total_failed = 0
         self.consecutive_failures = 0
         self.active_dl = 0
         self.active_up = 0
         self.current_task: Optional[int] = None
+        # Tốc độ từng transfer đang chạy, khoá là (kind, task_id). Ghi đè một
+        # biến dl_speed duy nhất là sai khi có nhiều transfer song song: con số
+        # hiện lên dashboard nhảy loạn theo transfer nào vừa gọi callback.
+        self._speeds: dict[tuple, float] = {}
+
+    def set_speed(self, kind: str, task_id: int, speed: float):
+        self._speeds[(kind, task_id)] = speed
+
+    def clear_speed(self, kind: str, task_id: int):
+        self._speeds.pop((kind, task_id), None)
+
+    def _sum(self, kind: str) -> float:
+        return sum(v for (k, _), v in self._speeds.items() if k == kind)
+
+    @property
+    def dl_speed(self) -> float:
+        return self._sum("dl")
+
+    @property
+    def up_speed(self) -> float:
+        return self._sum("up")
 
     def snapshot(self, dl_limit: int, up_limit: int) -> dict:
         return {
@@ -449,10 +468,7 @@ def make_progress_cb(
             return
         state["last"] = now
         speed = current / max(0.001, now - state["start"])
-        if kind == "dl":
-            stats.dl_speed = speed
-        else:
-            stats.up_speed = speed
+        stats.set_speed(kind, task_id, speed)
         await enqueue_progress(
             r,
             {
@@ -548,6 +564,7 @@ async def _handle_download(
                     )
             finally:
                 stats.active_dl -= 1
+                stats.clear_speed("dl", task_id)
 
             # download_media nuốt exception và trả None khi tải lỗi
             if not path or not os.path.exists(path):
@@ -556,7 +573,6 @@ async def _handle_download(
             elapsed = max(0.001, time.time() - start)
             size = os.path.getsize(path)
             speed = size / elapsed
-            stats.dl_speed = speed
 
         if size == 0:
             # Pyrogram tạo file rỗng khi media hỏng/không tải được
@@ -782,11 +798,11 @@ async def _handle_upload(
                 )
         finally:
             stats.active_up -= 1
+            stats.clear_speed("up", task_id)
 
         elapsed = max(0.001, time.time() - start)
         size = os.path.getsize(path) if os.path.exists(path) else (task.size_bytes or 0)
         speed = size / elapsed
-        stats.up_speed = speed
 
         # LƯU Ý: updated_at là cột DateTime. Truyền time.time() (float) vào đây
         # sẽ ném lỗi ở tầng driver, rồi commit trong except gây PendingRollbackError
