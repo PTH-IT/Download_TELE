@@ -43,6 +43,7 @@ from shared.constants import (
 )
 from shared.job_state import job_is_cancelled, refresh_job_counters, update_task_status
 from shared.peers import normalize_peer
+from shared.transfer import TransferProgress, run_with_stall_guard
 from shared.phone import InvalidPhoneNumber, mask_phone, normalize_phone
 
 try:
@@ -117,6 +118,9 @@ MAX_TRANSIENT_ATTEMPTS = int(os.getenv("MAX_TRANSIENT_ATTEMPTS", "12"))
 # và task treo ở trạng thái downloading suốt thời gian đó.
 LOCK_TTL = int(os.getenv("TASK_LOCK_TTL", "300"))
 LOCK_REFRESH_INTERVAL = max(10, LOCK_TTL // 3)
+# Kết nối Telegram hỏng hẳn thì mọi transfer sau đều fail. Sau ngần này lần
+# fail liên tiếp, worker tự thoát để Docker dựng lại với kết nối sạch.
+CONSECUTIVE_FAILURE_LIMIT = int(os.getenv("CONSECUTIVE_FAILURE_LIMIT", "25"))
 SCAN_CAP = int(os.getenv("SCAN_CAP", "200"))
 PROGRESS_INTERVAL = float(os.getenv("PROGRESS_INTERVAL", "1.0"))
 CAPTION_LIMIT = 1024
@@ -181,6 +185,7 @@ class WorkerStats:
         self.up_speed = 0.0
         self.total_done = 0
         self.total_failed = 0
+        self.consecutive_failures = 0
         self.active_dl = 0
         self.active_up = 0
         self.current_task: Optional[int] = None
@@ -193,6 +198,7 @@ class WorkerStats:
             "up_speed_mbs": round(self.up_speed / (1 << 20), 2),
             "total_done": self.total_done,
             "total_failed": self.total_failed,
+            "consecutive_failures": self.consecutive_failures,
             "active_dl": self.active_dl,
             "active_up": self.active_up,
             "max_dl": dl_limit,
@@ -370,6 +376,19 @@ async def fail_or_retry(
     transient: bool = False,
 ):
     """Task lỗi: còn lượt thì đẩy lại hàng đợi, hết lượt thì đánh failed."""
+    stats.consecutive_failures += 1
+    if stats.consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+        # Kết nối Telegram hỏng hẳn: mọi transfer đều fail, ở lại cũng vô ích.
+        # Thoát để Docker (restart: unless-stopped) dựng lại với kết nối sạch.
+        log.critical(
+            "%s lần fail liên tiếp — kết nối Telegram hỏng, thoát để khởi động lại",
+            stats.consecutive_failures,
+        )
+        await update_task_status(db, task.id, TASK_STATUS_PENDING, error=error[:2000])
+        await db.commit()
+        await r.zadd(queue, {str(task.id): time.time()})
+        os._exit(1)
+
     attempt = (task.attempt or 0) + 1
     budget = MAX_TRANSIENT_ATTEMPTS if transient else MAX_ATTEMPTS
     if attempt < budget:
@@ -403,12 +422,22 @@ async def fail_or_retry(
     )
 
 
-def make_progress_cb(r: aioredis.Redis, kind: str, task_id: int, job_id: int, stats: WorkerStats):
+def make_progress_cb(
+    r: aioredis.Redis,
+    kind: str,
+    task_id: int,
+    job_id: int,
+    stats: WorkerStats,
+    progress: Optional[TransferProgress] = None,
+):
     """Progress callback có throttle — không spam Redis mỗi chunk."""
     state = {"last": 0.0, "start": time.time()}
 
     async def _cb(current: int, total: int):
         now = time.time()
+        # watchdog phải thấy MỌI callback, không phụ thuộc throttle
+        if progress is not None:
+            progress.touch(current)
         if now - state["last"] < PROGRESS_INTERVAL and current != total:
             return
         state["last"] = now
@@ -498,10 +527,17 @@ async def _handle_download(
             try:
                 async with dl_sem:
                     start = time.time()
-                    path = await app.download_media(
-                        msg,
-                        file_name=local_path,
-                        progress=make_progress_cb(r, "dl", task_id, job.id, stats),
+                    dl_progress = TransferProgress()
+                    path = await run_with_stall_guard(
+                        app.download_media(
+                            msg,
+                            file_name=local_path,
+                            progress=make_progress_cb(
+                                r, "dl", task_id, job.id, stats, dl_progress
+                            ),
+                        ),
+                        dl_progress,
+                        f"Tải task {task_id}",
                     )
             finally:
                 stats.active_dl -= 1
@@ -553,6 +589,7 @@ async def _handle_download(
         await enqueue_progress(
             r, {"worker_id": WORKER_ID, "type": "dl_done", "task_id": task_id, "job_id": job.id}
         )
+        stats.consecutive_failures = 0
         log.info("Tải xong task %s (%.1f MB, %.2f MB/s)", task_id, size / (1 << 20), speed / (1 << 20))
 
     except FloodWait as e:
@@ -723,13 +760,18 @@ async def _handle_upload(
         try:
             async with up_sem:
                 start = time.time()
-                await _send_media(
-                    app,
-                    dst_peer,
-                    kind,
-                    path,
-                    caption,
-                    make_progress_cb(r, "up", task_id, job.id, stats),
+                up_progress = TransferProgress()
+                await run_with_stall_guard(
+                    _send_media(
+                        app,
+                        dst_peer,
+                        kind,
+                        path,
+                        caption,
+                        make_progress_cb(r, "up", task_id, job.id, stats, up_progress),
+                    ),
+                    up_progress,
+                    f"Upload task {task_id}",
                 )
         finally:
             stats.active_up -= 1
@@ -748,6 +790,7 @@ async def _handle_upload(
         await db.commit()
 
         stats.total_done += 1
+        stats.consecutive_failures = 0
 
         if DELETE_AFTER_UPLOAD:
             try:
