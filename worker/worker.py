@@ -227,11 +227,18 @@ async def resolve_chat(app: Client, raw) -> Union[int, str]:
     try:
         chat = await app.get_chat(peer)
         resolved = chat.id
+        _PEER_CACHE[key] = resolved
+        return resolved
     except Exception as exc:
-        log.warning("Không resolve được chat %r qua get_chat: %s", raw, exc)
-        resolved = peer
-    _PEER_CACHE[key] = resolved
-    return resolved
+        # KHÔNG cache giá trị dự phòng. Nếu get_chat hỏng tạm thời (Broken pipe)
+        # mà ta cache lại chuỗi gốc thì mọi transfer sau của process này đều gửi
+        # link mời vào chỗ chờ username -> USERNAME_INVALID vĩnh viễn.
+        if isinstance(peer, int):
+            # chat id số dùng thẳng được, get_chat chỉ để nạp peer vào session
+            log.warning("get_chat(%r) lỗi, dùng chat id trực tiếp: %s", raw, exc)
+            return peer
+        # username / link mời thì bắt buộc phải resolve được mới gửi đi được
+        raise RuntimeError(f"Không resolve được chat {raw!r}: {exc}") from exc
 
 
 async def enqueue_progress(r: aioredis.Redis, payload: dict):
