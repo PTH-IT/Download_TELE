@@ -13,14 +13,18 @@ from ..models import Job, Task
 from ..redis_client import get_redis
 from ..task_utils import can_retry_task_status
 from shared.constants import (
+    ABORT_PREFIX,
+    PROGRESS_PREFIX,
     JOB_STATUS_CANCELLED,
     JOB_STATUS_RUNNING,
     QUEUE_DOWNLOAD,
     QUEUE_NEW_JOB,
     QUEUE_UPLOAD,
     TASK_STATUS_CANCELLED,
+    TASK_STATUS_DOWNLOADING,
     TASK_STATUS_FAILED,
     TASK_STATUS_PENDING,
+    TASK_STATUS_UPLOADING,
     WORKER_HEARTBEAT,
     WORKER_STATUS,
 )
@@ -199,6 +203,34 @@ async def retry_task(
     return {"ok": True, "task_id": task_id}
 
 
+@router.post("/{job_id}/tasks/{task_id}/abort")
+async def abort_task(
+    job_id: int,
+    task_id: int,
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+):
+    """Huỷ transfer đang chạy và đẩy task về hàng đợi để làm lại.
+
+    Worker kiểm tra cờ này mỗi 15 giây trong lúc truyền, huỷ coroutine đang
+    chạy rồi đưa task về pending. File đã tải xong vẫn được giữ, nên với một
+    upload chậm thì đây thực chất là "thử upload lại từ đầu".
+    """
+    task = await db.get(Task, task_id)
+    if not task or task.job_id != job_id:
+        raise HTTPException(404, "Task không tồn tại")
+
+    status = (task.status or "").lower()
+    if status not in (TASK_STATUS_DOWNLOADING, TASK_STATUS_UPLOADING):
+        raise HTTPException(
+            400, f"Chỉ huỷ được task đang chạy, task này đang ở trạng thái '{status}'"
+        )
+
+    # TTL đủ dài để worker kịp thấy, đủ ngắn để không treo lần chạy sau
+    await redis.set(f"{ABORT_PREFIX}{task_id}", "1", ex=600)
+    return {"ok": True, "task_id": task_id, "status": "abort_requested"}
+
+
 @router.post("/{job_id}/retry_failed")
 async def retry_failed_tasks(
     job_id: int,
@@ -241,6 +273,7 @@ async def job_tasks(
     offset: int = Query(0, ge=0),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
 ):
     """Danh sách task có phân trang.
 
@@ -274,6 +307,33 @@ async def job_tasks(
     )
     tasks = result.scalars().all()
 
+    # Tiến độ transfer đang chạy nằm ở Redis (worker ghi mỗi giây), không ghi
+    # DB liên tục cho hàng chục task cùng lúc.
+    live = {}
+    running = [t.id for t in tasks if (t.status or "").lower() in (TASK_STATUS_DOWNLOADING, TASK_STATUS_UPLOADING)]
+    if running:
+        pipe = redis.pipeline()
+        for tid in running:
+            pipe.hgetall(f"{PROGRESS_PREFIX}{tid}")
+        for tid, data in zip(running, await pipe.execute()):
+            if data:
+                live[tid] = data
+
+    def _progress(task_id: int) -> dict:
+        data = live.get(task_id)
+        if not data:
+            return {"progress_current": None, "progress_total": None, "progress_pct": None}
+        try:
+            current = int(data.get("current") or 0)
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            return {"progress_current": None, "progress_total": None, "progress_pct": None}
+        return {
+            "progress_current": round(current / (1 << 20), 1),
+            "progress_total": round(total / (1 << 20), 1) if total else None,
+            "progress_pct": round(current / total * 100, 1) if total else None,
+        }
+
     return {
         "items": [
             {
@@ -286,6 +346,7 @@ async def job_tasks(
                 "size_mb": round(t.size_bytes / (1 << 20), 1) if t.size_bytes else 0,
                 "error": t.error,
                 "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+                **_progress(t.id),
             }
             for t in tasks
         ],

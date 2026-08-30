@@ -7,6 +7,8 @@ QUEUE_RETRY      = "queue:retry"       # LIST dead-letter
 QUEUE_NEW_JOB    = "queue:new_job"     # LIST job mới do API đẩy sang worker
 PUBSUB_PROGRESS  = "progress"          # channel pub/sub cho WebSocket
 LOCK_PREFIX      = "lock:task:"        # distributed lock mỗi task
+ABORT_PREFIX     = "abort:task:"       # cờ yêu cầu huỷ transfer đang chạy
+PROGRESS_PREFIX  = "progress:task:"    # HASH tiến độ transfer đang chạy
 WORKER_HEARTBEAT = "workers:heartbeat" # HASH worker_id -> timestamp
 WORKER_STATUS    = "workers:status"    # HASH worker_id -> json status
 

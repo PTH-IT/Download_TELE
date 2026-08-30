@@ -242,6 +242,19 @@
         color: var(--muted);
         font-size: 0.82rem;
       }
+
+      .mini-bar {
+        margin-top: 4px;
+        height: 4px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.12);
+        overflow: hidden;
+      }
+      .mini-bar span {
+        display: block;
+        height: 100%;
+        background: linear-gradient(90deg, var(--accent), var(--accent-2, var(--accent)));
+      }
     </style>
   </head>
   <body>
@@ -349,6 +362,7 @@
                   <th>Trạng thái</th>
                   <th>Worker</th>
                   <th>Kích thước (MB)</th>
+                  <th>Đã truyền</th>
                   <th>Tốc độ DL</th>
                   <th>Tốc độ UP</th>
                   <th>Lỗi</th>
@@ -498,7 +512,7 @@
             const msg = tableState.status || tableState.q
               ? "Không có task nào khớp bộ lọc."
               : "Chưa có task nào được tạo cho job này.";
-            tbody.innerHTML = `<tr><td colspan="9" style="text-align:center; color:var(--muted); padding:24px 0;">${msg}</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="10" style="text-align:center; color:var(--muted); padding:24px 0;">${msg}</td></tr>`;
             renderPagination();
             showCancelButton(job);
             showRetryButton(tasks.counts || {});
@@ -506,7 +520,7 @@
           }
           tbody.innerHTML = items.map(t => {
             const taskStatus = formatStatus(t.status);
-            const canRetry = (t.status || "").toLowerCase() === "failed" || (t.status || "").toLowerCase() === "cancelled";
+
             return `
               <tr>
                 <td><strong>#${t.id}</strong></td>
@@ -514,10 +528,11 @@
                 <td>${statusBadge(t.status, taskStatus.label)}</td>
                 <td>${t.worker_id || "—"}</td>
                 <td>${Number(t.size_mb || 0).toFixed(1)} MB</td>
+                <td>${transferredCell(t)}</td>
                 <td>${Number(t.speed_dl || 0).toFixed(2)} MB/s</td>
                 <td>${Number(t.speed_up || 0).toFixed(2)} MB/s</td>
                 <td style="color:var(--accent-2);">${t.error || "—"}</td>
-                <td>${canRetry ? `<button class="btn btn-secondary" style="padding:4px 10px; font-size:0.8rem;" onclick="retryTask(${jobId}, ${t.id})">Retry</button>` : "—"}</td>
+                <td>${rowAction(jobId, t)}</td>
               </tr>
             `;
           }).join("");
@@ -640,6 +655,64 @@
         const target = Math.min(Math.max(1, page), last);
         tableState.offset = (target - 1) * tableState.limit;
         renderJobDetail();
+      }
+
+
+      // Dung lượng đã truyền của transfer đang chạy (worker ghi vào Redis).
+      function transferredCell(t) {
+        const st = (t.status || "").toLowerCase();
+        if (t.progress_current !== null && t.progress_current !== undefined) {
+          const total = t.progress_total ? `${t.progress_total} MB` : "?";
+          const pct = t.progress_pct !== null && t.progress_pct !== undefined
+            ? ` (${t.progress_pct}%)` : "";
+          const bar = t.progress_pct !== null && t.progress_pct !== undefined
+            ? `<div class="mini-bar"><span style="width:${Math.min(100, t.progress_pct)}%"></span></div>`
+            : "";
+          return `${t.progress_current} MB / ${total}${pct}${bar}`;
+        }
+        if (st === "done") return `${Number(t.size_mb || 0).toFixed(1)} MB (100%)`;
+        if (st === "downloading" || st === "uploading") return "đang chờ số liệu…";
+        return "—";
+      }
+
+      function rowAction(jobId, t) {
+        const st = (t.status || "").toLowerCase();
+        const btn = (label, fn, title) =>
+          `<button class="btn btn-secondary" style="padding:4px 10px; font-size:0.8rem;"
+                   title="${title}" onclick="${fn}">${label}</button>`;
+
+        if (st === "failed" || st === "cancelled") {
+          return btn("Retry", `retryTask(${jobId}, ${t.id})`, "Đẩy lại task vào hàng đợi");
+        }
+        if (st === "downloading" || st === "uploading") {
+          return btn(
+            "Hủy & làm lại",
+            `abortTask(${jobId}, ${t.id})`,
+            "Dừng transfer đang chạy và đưa task về hàng đợi. File đã tải xong vẫn được giữ."
+          );
+        }
+        return "—";
+      }
+
+      async function abortTask(jobId, taskId) {
+        if (!confirm(
+          `Dừng transfer của task #${taskId}?\n\n` +
+          `Task sẽ quay lại hàng đợi. File đã tải xong được giữ lại nên ` +
+          `bước tải sẽ tự bỏ qua, tức là thử lại từ đầu phần upload.`
+        )) return;
+
+        try {
+          const res = await fetch(`${API_BASE}/api/jobs/${jobId}/tasks/${taskId}/abort`, {
+            method: "POST",
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || `Lỗi ${res.status}`);
+          const out = document.getElementById("retryResult");
+          out.textContent = `Đã gửi lệnh hủy task #${taskId}, worker sẽ dừng trong ~15 giây.`;
+          setTimeout(() => { out.textContent = ""; }, 10000);
+        } catch (e) {
+          alert(`Hủy thất bại: ${e.message}`);
+        }
       }
 
       async function cancelJob() {

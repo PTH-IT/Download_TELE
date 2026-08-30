@@ -35,12 +35,17 @@ class TransferProgress:
         return time.time() - self.last_move
 
 
+class TransferAborted(Exception):
+    """Người dùng bấm huỷ transfer đang chạy."""
+
+
 async def run_with_stall_guard(
     coro,
     progress: "TransferProgress",
     label: str,
     stall_timeout: int = TRANSFER_STALL_TIMEOUT,
     poll_interval: float = _POLL_INTERVAL,
+    should_abort=None,
 ):
     """Chạy transfer, huỷ nếu không nhúc nhích quá stall_timeout."""
     task = asyncio.create_task(coro)
@@ -49,6 +54,16 @@ async def run_with_stall_guard(
             done, _ = await asyncio.wait({task}, timeout=poll_interval)
             if task in done:
                 return task.result()
+
+            # Yêu cầu huỷ từ dashboard được kiểm tra cùng nhịp với watchdog
+            if should_abort is not None and await should_abort():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise TransferAborted(f"{label} bị huỷ theo yêu cầu")
+
             if progress.stalled_for > stall_timeout:
                 task.cancel()
                 try:

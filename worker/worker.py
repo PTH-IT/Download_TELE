@@ -26,6 +26,8 @@ from shared.constants import (
     QUEUE_UPLOAD,
     QUEUE_NEW_JOB,
     LOCK_PREFIX,
+    ABORT_PREFIX,
+    PROGRESS_PREFIX,
     AUTH_LOCK_KEY,
     AUTH_SESSION_KEY,
     AUTH_OTP_QUEUE,
@@ -43,7 +45,7 @@ from shared.constants import (
 )
 from shared.job_state import job_is_cancelled, refresh_job_counters, update_task_status
 from shared.peers import normalize_peer
-from shared.transfer import TransferProgress, run_with_stall_guard
+from shared.transfer import TransferAborted, TransferProgress, run_with_stall_guard
 from shared.phone import InvalidPhoneNumber, mask_phone, normalize_phone
 
 try:
@@ -281,6 +283,23 @@ def _is_stale_request(payload: dict) -> bool:
         return False
 
 
+def make_abort_check(r: aioredis.Redis, task_id: int):
+    async def _check() -> bool:
+        try:
+            return bool(await r.exists(f"{ABORT_PREFIX}{task_id}"))
+        except Exception:
+            return False
+
+    return _check
+
+
+async def clear_abort(r: aioredis.Redis, task_id: int):
+    try:
+        await r.delete(f"{ABORT_PREFIX}{task_id}")
+    except Exception:
+        pass
+
+
 async def release_lock(r: aioredis.Redis, lock_key: str):
     try:
         await r.delete(lock_key)
@@ -481,6 +500,23 @@ def make_progress_cb(
                 "speed": speed,
             },
         )
+        # Lưu tiến độ để API trả về được "đã tải/đã upload bao nhiêu". Dùng
+        # Redis có TTL thay vì ghi DB liên tục cho hàng chục transfer.
+        try:
+            key = f"{PROGRESS_PREFIX}{task_id}"
+            await r.hset(
+                key,
+                mapping={
+                    "kind": kind,
+                    "current": str(current),
+                    "total": str(total or 0),
+                    "speed": str(speed),
+                    "worker_id": WORKER_ID,
+                },
+            )
+            await r.expire(key, 120)
+        except Exception:
+            pass
 
     return _cb
 
@@ -561,6 +597,7 @@ async def _handle_download(
                         ),
                         dl_progress,
                         f"Tải task {task_id}",
+                        should_abort=make_abort_check(r, task_id),
                     )
             finally:
                 stats.active_dl -= 1
@@ -615,6 +652,13 @@ async def _handle_download(
         stats.consecutive_failures = 0
         log.info("Tải xong task %s (%.1f MB, %.2f MB/s)", task_id, size / (1 << 20), speed / (1 << 20))
 
+    except TransferAborted as e:
+        log.info("Task %s: %s", task_id, e)
+        await db.rollback()
+        await clear_abort(r, task_id)
+        await update_task_status(db, task_id, TASK_STATUS_PENDING, error=None)
+        await db.commit()
+        await r.zadd(QUEUE_DOWNLOAD, {str(task_id): time.time()})
     except FloodWait as e:
         wait = int(getattr(e, "value", 30)) + 1
         log.warning("FloodWait %ss khi tải task %s", wait, task_id)
@@ -795,6 +839,7 @@ async def _handle_upload(
                     ),
                     up_progress,
                     f"Upload task {task_id}",
+                    should_abort=make_abort_check(r, task_id),
                 )
         finally:
             stats.active_up -= 1
@@ -826,6 +871,15 @@ async def _handle_upload(
         )
         log.info("Upload xong task %s (%.2f MB/s)", task_id, speed / (1 << 20))
 
+    except TransferAborted as e:
+        # Đưa về hàng đợi download: file còn nguyên thì bước tải sẽ tự bỏ qua,
+        # nên thực chất là thử upload lại từ đầu.
+        log.info("Task %s: %s", task_id, e)
+        await db.rollback()
+        await clear_abort(r, task_id)
+        await update_task_status(db, task_id, TASK_STATUS_PENDING, error=None)
+        await db.commit()
+        await r.zadd(QUEUE_DOWNLOAD, {str(task_id): time.time()})
     except FloodWait as e:
         wait = int(getattr(e, "value", 30)) + 1
         log.warning("FloodWait %ss khi upload task %s", wait, task_id)
