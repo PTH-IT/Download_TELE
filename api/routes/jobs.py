@@ -1,0 +1,358 @@
+"""api/routes/jobs.py"""
+import json
+import time
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import get_db
+from ..models import Job, Task
+from ..redis_client import get_redis
+from ..task_utils import can_retry_task_status
+from shared.constants import (
+    ABORT_PREFIX,
+    PROGRESS_PREFIX,
+    JOB_STATUS_CANCELLED,
+    JOB_STATUS_RUNNING,
+    QUEUE_DOWNLOAD,
+    QUEUE_NEW_JOB,
+    QUEUE_UPLOAD,
+    TASK_STATUS_CANCELLED,
+    TASK_STATUS_DOWNLOADING,
+    TASK_STATUS_FAILED,
+    TASK_STATUS_PENDING,
+    TASK_STATUS_UPLOADING,
+    WORKER_HEARTBEAT,
+    WORKER_STATUS,
+)
+from shared.peers import normalize_peer
+
+router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+HEARTBEAT_TIMEOUT = 30
+
+
+class JobCreate(BaseModel):
+    src_link: str
+    dst_link: str
+    from_msg_id: Optional[int] = None
+    to_msg_id: Optional[int] = None
+
+
+class JobOut(BaseModel):
+    id: int
+    src_link: str
+    dst_link: str
+    src_title: Optional[str]
+    dst_title: Optional[str]
+    status: str
+    total: int
+    done: int
+    failed: int
+
+    class Config:
+        from_attributes = True
+
+
+def _job_dict(job: Job) -> dict:
+    return {
+        "id": job.id,
+        "src_link": job.src_link,
+        "dst_link": job.dst_link,
+        "src_title": job.src_title,
+        "dst_title": job.dst_title,
+        "status": job.status,
+        "total": job.total or 0,
+        "done": job.done or 0,
+        "failed": job.failed or 0,
+    }
+
+
+async def _ready_workers(redis) -> int:
+    """Worker còn heartbeat VÀ đã đăng nhập Telegram xong."""
+    heartbeats = await redis.hgetall(WORKER_HEARTBEAT)
+    statuses = await redis.hgetall(WORKER_STATUS)
+    now = time.time()
+    ready = 0
+    for worker_id, ts in heartbeats.items():
+        try:
+            if now - float(ts) >= HEARTBEAT_TIMEOUT:
+                continue
+        except (TypeError, ValueError):
+            continue
+        try:
+            state = json.loads(statuses.get(worker_id) or "{}")
+        except ValueError:
+            state = {}
+        if state.get("session") == "ready":
+            ready += 1
+    return ready
+
+
+@router.get("", response_model=List[JobOut])
+async def list_jobs(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Job).order_by(Job.created_at.desc()).limit(100))
+    return [_job_dict(job) for job in result.scalars().all()]
+
+
+@router.get("/{job_id}", response_model=JobOut)
+async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, "Job không tồn tại")
+    return _job_dict(job)
+
+
+@router.post("", response_model=JobOut, status_code=201)
+async def create_job(
+    body: JobCreate,
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+):
+    # Validate sớm: link sai định dạng sẽ làm worker fail từng task một cách khó hiểu
+    try:
+        normalize_peer(body.src_link)
+        normalize_peer(body.dst_link)
+    except ValueError as exc:
+        raise HTTPException(400, f"Link chat không hợp lệ: {exc}")
+
+    if body.from_msg_id is not None and body.to_msg_id is None:
+        raise HTTPException(400, "Cần nhập cả from_msg_id và to_msg_id, hoặc bỏ trống cả hai")
+    if body.to_msg_id is not None and body.from_msg_id is None:
+        raise HTTPException(400, "Cần nhập cả from_msg_id và to_msg_id, hoặc bỏ trống cả hai")
+
+    if await _ready_workers(redis) == 0:
+        raise HTTPException(
+            503,
+            "Chưa có worker nào sẵn sàng — kiểm tra worker đã chạy và đã đăng nhập Telegram chưa",
+        )
+
+    job = Job(src_link=body.src_link, dst_link=body.dst_link, status=JOB_STATUS_RUNNING)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    # Gửi lệnh tới worker qua Redis — worker sẽ scan history và enqueue tasks
+    payload = {
+        "job_id": job.id,
+        "src_link": body.src_link,
+        "dst_link": body.dst_link,
+        "from_msg_id": body.from_msg_id,
+        "to_msg_id": body.to_msg_id,
+    }
+    await redis.lpush(QUEUE_NEW_JOB, json.dumps(payload))
+    return _job_dict(job)
+
+
+@router.delete("/{job_id}/cancel")
+async def cancel_job(job_id: int, db: AsyncSession = Depends(get_db), redis=Depends(get_redis)):
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, "Job không tồn tại")
+
+    result = await db.execute(
+        select(Task.id).where(Task.job_id == job_id, Task.status == TASK_STATUS_PENDING)
+    )
+    pending_ids = [str(row[0]) for row in result.all()]
+
+    job.status = JOB_STATUS_CANCELLED
+    await db.execute(
+        update(Task)
+        .where(Task.job_id == job_id, Task.status == TASK_STATUS_PENDING)
+        .values(status=TASK_STATUS_CANCELLED)
+    )
+    await db.commit()
+
+    # Gỡ luôn khỏi hàng đợi Redis, nếu không worker vẫn pop ra rồi mới bỏ
+    if pending_ids:
+        await redis.zrem(QUEUE_DOWNLOAD, *pending_ids)
+        await redis.zrem(QUEUE_UPLOAD, *pending_ids)
+
+    return {"ok": True, "cancelled": len(pending_ids)}
+
+
+@router.post("/{job_id}/tasks/{task_id}/retry")
+async def retry_task(
+    job_id: int,
+    task_id: int,
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+):
+    task = await db.get(Task, task_id)
+    if not task or task.job_id != job_id:
+        raise HTTPException(404, "Task không tồn tại")
+    if not can_retry_task_status(task.status):
+        raise HTTPException(400, "Task này không thể retry")
+
+    task.status = TASK_STATUS_PENDING
+    task.error = None
+    task.worker_id = None
+    task.attempt = 0
+
+    # Mở lại job: nếu job vẫn ở done/cancelled thì worker sẽ coi task này là
+    # việc thừa và huỷ ngay sau khi tải xong.
+    job = await db.get(Job, job_id)
+    if job and job.status != JOB_STATUS_RUNNING:
+        job.status = JOB_STATUS_RUNNING
+    await db.commit()
+
+    await redis.zadd(QUEUE_DOWNLOAD, {str(task.id): 0})
+    return {"ok": True, "task_id": task_id}
+
+
+@router.post("/{job_id}/tasks/{task_id}/abort")
+async def abort_task(
+    job_id: int,
+    task_id: int,
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+):
+    """Huỷ transfer đang chạy và đẩy task về hàng đợi để làm lại.
+
+    Worker kiểm tra cờ này mỗi 15 giây trong lúc truyền, huỷ coroutine đang
+    chạy rồi đưa task về pending. File đã tải xong vẫn được giữ, nên với một
+    upload chậm thì đây thực chất là "thử upload lại từ đầu".
+    """
+    task = await db.get(Task, task_id)
+    if not task or task.job_id != job_id:
+        raise HTTPException(404, "Task không tồn tại")
+
+    status = (task.status or "").lower()
+    if status not in (TASK_STATUS_DOWNLOADING, TASK_STATUS_UPLOADING):
+        raise HTTPException(
+            400, f"Chỉ huỷ được task đang chạy, task này đang ở trạng thái '{status}'"
+        )
+
+    # TTL đủ dài để worker kịp thấy, đủ ngắn để không treo lần chạy sau
+    await redis.set(f"{ABORT_PREFIX}{task_id}", "1", ex=600)
+    return {"ok": True, "task_id": task_id, "status": "abort_requested"}
+
+
+@router.post("/{job_id}/retry_failed")
+async def retry_failed_tasks(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+):
+    """Đẩy lại toàn bộ task failed/cancelled của job vào hàng đợi."""
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, "Job không tồn tại")
+
+    result = await db.execute(
+        select(Task.id).where(
+            Task.job_id == job_id,
+            Task.status.in_([TASK_STATUS_FAILED, TASK_STATUS_CANCELLED]),
+        )
+    )
+    task_ids = [row[0] for row in result.all()]
+    if not task_ids:
+        return {"ok": True, "requeued": 0}
+
+    await db.execute(
+        update(Task)
+        .where(Task.id.in_(task_ids))
+        .values(status=TASK_STATUS_PENDING, error=None, worker_id=None, attempt=0)
+    )
+    job.status = JOB_STATUS_RUNNING
+    await db.commit()
+
+    await redis.zadd(QUEUE_DOWNLOAD, {str(tid): 0 for tid in task_ids})
+    return {"ok": True, "requeued": len(task_ids)}
+
+
+@router.get("/{job_id}/tasks")
+async def job_tasks(
+    job_id: int,
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+):
+    """Danh sách task có phân trang.
+
+    Trả về kèm `total` (số task khớp bộ lọc) và `counts` (số task theo từng
+    trạng thái, không phụ thuộc bộ lọc) để client vẽ được thanh phân trang và
+    các nút lọc mà không phải tải toàn bộ task về.
+    """
+    filters = [Task.job_id == job_id]
+    if status:
+        filters.append(Task.status == status.lower())
+    if q:
+        term = q.strip()
+        if term.isdigit():
+            value = int(term)
+            filters.append(or_(Task.msg_id == value, Task.id == value))
+        elif term:
+            filters.append(Task.error.ilike(f"%{term}%"))
+
+    total = await db.scalar(select(func.count()).select_from(Task).where(*filters))
+
+    counts_result = await db.execute(
+        select(Task.status, func.count())
+        .where(Task.job_id == job_id)
+        .group_by(Task.status)
+    )
+    counts = {row[0]: int(row[1]) for row in counts_result.all()}
+
+    order_by = Task.id.asc() if order == "asc" else Task.id.desc()
+    result = await db.execute(
+        select(Task).where(*filters).order_by(order_by).limit(limit).offset(offset)
+    )
+    tasks = result.scalars().all()
+
+    # Tiến độ transfer đang chạy nằm ở Redis (worker ghi mỗi giây), không ghi
+    # DB liên tục cho hàng chục task cùng lúc.
+    live = {}
+    running = [t.id for t in tasks if (t.status or "").lower() in (TASK_STATUS_DOWNLOADING, TASK_STATUS_UPLOADING)]
+    if running:
+        pipe = redis.pipeline()
+        for tid in running:
+            pipe.hgetall(f"{PROGRESS_PREFIX}{tid}")
+        for tid, data in zip(running, await pipe.execute()):
+            if data:
+                live[tid] = data
+
+    def _progress(task_id: int) -> dict:
+        data = live.get(task_id)
+        if not data:
+            return {"progress_current": None, "progress_total": None, "progress_pct": None}
+        try:
+            current = int(data.get("current") or 0)
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            return {"progress_current": None, "progress_total": None, "progress_pct": None}
+        return {
+            "progress_current": round(current / (1 << 20), 1),
+            "progress_total": round(total / (1 << 20), 1) if total else None,
+            "progress_pct": round(current / total * 100, 1) if total else None,
+        }
+
+    return {
+        "items": [
+            {
+                "id": t.id,
+                "msg_id": t.msg_id,
+                "status": t.status,
+                "worker_id": t.worker_id,
+                "speed_dl": round(t.speed_dl / (1 << 20), 2) if t.speed_dl else 0,
+                "speed_up": round(t.speed_up / (1 << 20), 2) if t.speed_up else 0,
+                "size_mb": round(t.size_bytes / (1 << 20), 1) if t.size_bytes else 0,
+                "error": t.error,
+                "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+                **_progress(t.id),
+            }
+            for t in tasks
+        ],
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+        "order": order,
+        "counts": counts,
+    }

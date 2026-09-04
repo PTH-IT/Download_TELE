@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Danh Sách Jobs</title>
+    <style>
+      :root {
+        --bg: #07111d;
+        --panel: rgba(12, 24, 39, 0.92);
+        --panel-strong: #101d2e;
+        --line: rgba(255,255,255,0.08);
+        --text: #eff4fb;
+        --muted: #7f8ca3;
+        --accent: #66e0ff;
+        --accent-2: #ff7a59;
+        --good: #74f0b7;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(102,224,255,0.18), transparent 28%),
+          linear-gradient(135deg, #07111d 0%, #0b1825 100%);
+        color: var(--text);
+        min-height: 100vh;
+      }
+
+      .shell {
+        max-width: 1260px;
+        margin: 0 auto;
+        padding: 32px 20px 40px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        box-shadow: 0 18px 60px rgba(0,0,0,0.24);
+        backdrop-filter: blur(18px);
+      }
+
+      .card { padding: 20px; }
+
+      .section-title {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 14px;
+      }
+
+      .section-title h2 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 700;
+      }
+
+      .pill {
+        color: var(--muted);
+        font-size: 0.82rem;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 6px 10px;
+      }
+
+      .btn {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 16px;
+        font-weight: 700;
+        cursor: pointer;
+        color: var(--text);
+      }
+
+      .btn-primary { background: linear-gradient(90deg, var(--accent), #3cb7e0); }
+      .btn-secondary { background: rgba(255,255,255,0.08); }
+
+      .hero {
+        display: grid;
+        grid-template-columns: 1.3fr 0.7fr;
+        gap: 18px;
+        align-items: stretch;
+        margin-bottom: 18px;
+      }
+
+      .hero-main {
+        padding: 28px;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .hero-main::after {
+        content: "";
+        position: absolute;
+        inset: auto -40px -60px auto;
+        width: 240px;
+        height: 240px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(102,224,255,0.28), transparent 70%);
+        pointer-events: none;
+      }
+
+      .eyebrow {
+        display: inline-block;
+        color: var(--accent);
+        text-transform: uppercase;
+        letter-spacing: 0.25em;
+        font-size: 0.75rem;
+        font-weight: 700;
+        margin-bottom: 12px;
+      }
+
+      h1 {
+        font-size: clamp(1.8rem, 3vw, 2.6rem);
+        margin: 0 0 12px;
+        line-height: 1.06;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+      }
+
+      .lead {
+        color: var(--muted);
+        max-width: 62ch;
+        line-height: 1.6;
+        margin: 0 0 18px;
+      }
+
+      .hero-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+
+      .hero-side {
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .stat-grid {
+        display: grid;
+        gap: 12px;
+      }
+
+      .mini-stat {
+        padding: 14px;
+        background: var(--panel-strong);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+      }
+
+      .mini-stat strong {
+        display: block;
+        font-size: 1.15rem;
+        margin-top: 4px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th, td {
+        text-align: left;
+        padding: 10px 8px;
+        border-bottom: 1px solid var(--line);
+        font-size: 0.95rem;
+      }
+
+      th { color: var(--muted); font-weight: 600; }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-weight: 700;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--good);
+        box-shadow: 0 0 0 4px rgba(116,240,183,0.16);
+      }
+
+      .dot-done { background: var(--good); box-shadow: 0 0 0 4px rgba(116,240,183,0.16); }
+      .dot-running { background: var(--accent); box-shadow: 0 0 0 4px rgba(102,224,255,0.16); }
+      .dot-pending { background: var(--good); box-shadow: 0 0 0 4px rgba(116,240,183,0.16); }
+
+      .table-wrapper {
+        max-height: 500px;
+        overflow-y: auto;
+      }
+
+      .back-link {
+        color: var(--accent);
+        text-decoration: none;
+        font-size: 0.9rem;
+        margin-bottom: 16px;
+        display: inline-block;
+      }
+
+      .back-link:hover { text-decoration: underline; }
+
+      @media (max-width: 920px) {
+        .hero { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <a href="/" class="back-link">&larr; Trang chủ</a>
+
+      <section style="margin-bottom: 20px;">
+        <div class="panel card">
+          <div class="section-title">
+            <h2>Danh Sách Jobs</h2>
+            <select id="statusFilter" style="background: rgba(255,255,255,0.08); color: var(--text); border: 1px solid var(--line); border-radius: 999px; padding: 8px 12px;">
+              <option value="all">Tất cả</option>
+              <option value="pending">Pending</option>
+              <option value="active">Active</option>
+              <option value="done">Done</option>
+              <option value="failed">Failed</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+          </div>
+          <div class="table-wrapper" id="jobsTableWrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Job ID</th>
+                  <th>Tên Job</th>
+                  <th>Link/ID Nguồn</th>
+                  <th>Ngày tạo</th>
+                  <th>Trạng thái</th>
+                  <th>Hành động</th>
+                </tr>
+              </thead>
+              <tbody id="jobsTbody">
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <script src="config.js?v=3"></script>
+<script>
+      const API_BASE = (window.API_BASE || "").replace(/\/$/, "");
+
+      async function checkAuth() {
+        // Chỉ đá về login khi API nói rõ là chưa đăng nhập. Lỗi mạng / gọi
+        // nhầm cổng trước đây cũng bị coi là "chưa đăng nhập" nên vừa login
+        // xong đã bị đá ra, mà không hiện lý do.
+        let res;
+        try {
+          res = await fetch(`${API_BASE}/api/auth/state`, { method: "GET" });
+        } catch (e) {
+          window.showFatalError?.(`Không gọi được API (${API_BASE || location.origin}): ${e.message}`);
+          return false;
+        }
+        if (!res.ok) {
+          window.showFatalError?.(`API trả ${res.status} cho /api/auth/state — kiểm tra lại cấu hình API_BASE.`);
+          return false;
+        }
+        let state;
+        try {
+          state = await res.json();
+        } catch (e) {
+          window.showFatalError?.("API trả về dữ liệu không hợp lệ cho /api/auth/state.");
+          return false;
+        }
+        if (!state.authenticated) {
+          (window.goTo || ((p) => (window.location.href = p)))("/login.html");
+          return false;
+        }
+        return true;
+      }
+
+      function statusBadge(status) {
+        const s = (status || "").toLowerCase();
+        let label = "Pending";
+        let dotCls = "dot-pending";
+        if (s.includes("done") || s.includes("completed")) {
+          label = "Completed";
+          dotCls = "dot-done";
+        } else if (s.includes("failed")) {
+          label = "Failed";
+          dotCls = "dot-running";
+        } else if (s.includes("cancel")) {
+          label = "Cancelled";
+          dotCls = "dot-running";
+        } else if (s.includes("running") || s.includes("download") || s.includes("upload")) {
+          label = "Active";
+          dotCls = "dot-running";
+        }
+        return `<span class="status"><span class="dot ${dotCls}"></span>${label}</span>`;
+      }
+
+      async function fetchJobs() {
+        const res = await fetch(`${API_BASE}/api/jobs`, { method: "GET" });
+        if (!res.ok) throw new Error(`jobs: ${res.status}`);
+        return await res.json();
+      }
+
+      function filterJobs(jobs) {
+        const filter = document.getElementById("statusFilter")?.value || "all";
+        if (filter === "all") return jobs;
+        if (filter === "active") {
+          return jobs.filter(job => (job.status || "").toLowerCase().includes("running") || (job.status || "").toLowerCase().includes("download") || (job.status || "").toLowerCase().includes("upload"));
+        }
+        return jobs.filter(job => (job.status || "").toLowerCase().includes(filter));
+      }
+
+      async function renderJobs() {
+        try {
+          const jobs = await fetchJobs();
+          const tbody = document.getElementById("jobsTbody");
+          if (!tbody) return;
+
+          const visibleJobs = filterJobs(jobs);
+
+          if (!Array.isArray(visibleJobs) || visibleJobs.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color:var(--muted); padding:24px 0;">Không có job phù hợp với bộ lọc.</td></tr>`;
+            return;
+          }
+
+          tbody.innerHTML = visibleJobs.map(job => {
+            const created = job.created_at ? new Date(job.created_at).toLocaleDateString() : "—";
+            const source = job.src_link || "—";
+            const title = job.src_title || job.dst_title || "—";
+            return `
+              <tr data-job-id="${job.id}">
+                <td><strong>#JOB-${job.id}</strong></td>
+                <td>${title}</td>
+                <td style="max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${source}</td>
+                <td>${created}</td>
+                <td>${statusBadge(job.status)}</td>
+                <td><a href="/job-detail.html?id=${job.id}" class="btn btn-secondary" style="padding:4px 8px; font-size:0.8rem;">Xem Chi Tiết</a></td>
+              </tr>
+            `;
+          }).join("");
+        } catch (e) {
+          console.warn("renderJobs failed:", e?.message || e);
+        }
+      }
+
+      document.addEventListener("DOMContentLoaded", async () => {
+        const authenticated = await checkAuth();
+        if (!authenticated) return;
+
+        document.getElementById("statusFilter")?.addEventListener("change", renderJobs);
+        renderJobs();
+        setInterval(renderJobs, 5000);
+      });
+    </script>
+  </body>
+</html>

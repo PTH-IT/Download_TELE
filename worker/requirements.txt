@@ -1,0 +1,3 @@
+# Worker dùng chung requirements.txt ở thư mục gốc (cần cả sqlalchemy/asyncpg
+# vì import api.models). File này giữ lại cho trường hợp build worker riêng lẻ.
+-r ../requirements.txt

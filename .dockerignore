@@ -1,0 +1,24 @@
+.git/
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Dữ liệu runtime — KHÔNG đưa vào build context (nếu không build sẽ rất chậm)
+downloads/
+sessions/
+*.session
+*.mp4
+*.mkv
+
+# Binary lỡ tay
+*.exe
+*.crdownload
+*.onnx
+
+.blackbox/
+.kilo/
+web/node_modules/
